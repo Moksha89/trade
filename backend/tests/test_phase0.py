@@ -1,14 +1,8 @@
 """Phase 0 smoke tests: health endpoint + admin login flow."""
 
-import os
+from fastapi.testclient import TestClient
 
-os.environ.setdefault("ADMIN_USERNAME", "admin")
-os.environ.setdefault("ADMIN_PASSWORD", "secret123")
-os.environ.setdefault("JWT_SECRET", "testsecret")
-
-from fastapi.testclient import TestClient  # noqa: E402
-
-from app.main import app  # noqa: E402
+from app.main import app
 
 client = TestClient(app)
 

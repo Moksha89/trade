@@ -1,7 +1,9 @@
 """Application settings loaded from environment / .env.
 
-Only the subset of settings needed for Phase 0 is wired up here; the full
-contract lives in `.env.example` and will be consumed in later phases.
+These are process-level / infrastructure settings. Mutable trading configuration
+(risk limits, strategy toggles, AI options) lives in the database so it can be
+edited from the dashboard at runtime — see `app.models.SettingRow` and
+`app.services.settings_store`.
 """
 
 from __future__ import annotations
@@ -31,8 +33,54 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = 12 * 60
     public_base_url: str = "http://VPS_IP"
 
-    # CORS (comma-separated origins; "*" allows all — fine behind Nginx on VPS IP)
     cors_origins: str = "*"
+
+    # Database — defaults to a local SQLite file for the prototype; set
+    # DATABASE_URL to a postgresql+psycopg://… URL in production.
+    database_url: str = "sqlite:///./trading.db"
+
+    # Redis (reserved for later phases)
+    redis_url: str = "redis://redis:6379/0"
+
+    # Capital.com broker
+    capital_environment: str = "demo"  # demo | live
+    capital_api_key: str = ""
+    capital_identifier: str = ""
+    capital_password: str = ""
+    capital_demo_base_url: str = "https://demo-api-capital.backend-capital.com"
+    capital_live_base_url: str = "https://api-capital.backend-capital.com"
+    capital_ws_url: str = "wss://api-streaming-capital.backend-capital.com/connect"
+
+    # AI providers
+    ai_provider: str = "claude"
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-3-5-sonnet-latest"
+    openai_api_key: str = ""
+    ai_min_confidence: int = 70
+
+    # Risk engine defaults (AED). These seed the DB-backed risk settings on first run.
+    account_start_capital: float = 5000
+    max_active_trades: int = 2
+    max_risk_per_trade: float = 50
+    max_combined_open_risk: float = 100
+    max_trades_per_day: int = 3
+    daily_max_loss: float = 150
+    weekly_max_loss: float = 400
+    stop_after_n_losses: int = 2
+    min_risk_reward: float = 2.0
+
+    # News / calendar
+    news_api_key: str = ""
+
+    # Telegram
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+
+    @property
+    def capital_base_url(self) -> str:
+        if self.capital_environment.lower() == "live":
+            return self.capital_live_base_url
+        return self.capital_demo_base_url
 
 
 settings = Settings()
