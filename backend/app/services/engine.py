@@ -107,6 +107,8 @@ def run_scan(db: Session) -> list[TradeIdea]:
             },
             model=ai_cfg.get("model"),
         )
+        # The AI must analyse the scanned instrument; never trust an echoed value.
+        proposal.instrument = instrument
         log_event(
             db,
             "ai_response",

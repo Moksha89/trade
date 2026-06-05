@@ -36,13 +36,28 @@ def get_db() -> Iterator[Session]:
         db.close()
 
 
-def init_db() -> None:
-    """Create tables and seed defaults. Safe to call repeatedly."""
+def init_db(retries: int = 30, delay: float = 2.0) -> None:
+    """Create tables and seed defaults. Safe to call repeatedly.
+
+    Retries the initial connection so it tolerates Docker Compose start
+    ordering (the database may not accept connections immediately).
+    """
+    import time
+
+    from sqlalchemy.exc import OperationalError
+
     # Import models so they register on the metadata before create_all.
     from app import models  # noqa: F401
     from app.services.settings_store import seed_defaults
 
-    Base.metadata.create_all(bind=engine)
+    for attempt in range(1, retries + 1):
+        try:
+            Base.metadata.create_all(bind=engine)
+            break
+        except OperationalError:
+            if attempt == retries:
+                raise
+            time.sleep(delay)
     with SessionLocal() as db:
         seed_defaults(db)
         db.commit()

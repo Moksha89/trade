@@ -16,10 +16,13 @@ import json
 import signal
 from datetime import datetime, timezone
 
+import time
+
 from apscheduler.schedulers.blocking import BlockingScheduler
+from sqlalchemy import text
 
 from app.config import settings
-from app.db import SessionLocal, init_db
+from app.db import SessionLocal, engine as db_engine, init_db
 from app.services import engine
 from app.services.settings_store import get_bot_state
 
@@ -27,6 +30,19 @@ from app.services.settings_store import get_bot_state
 def _log(event: str, **detail) -> None:
     print(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), "event": event, **detail}),
           flush=True)
+
+
+def _wait_for_db(retries: int = 30, delay: float = 2.0) -> None:
+    """Block until the database accepts connections (compose start ordering)."""
+    for attempt in range(1, retries + 1):
+        try:
+            with db_engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            return
+        except Exception as exc:  # noqa: BLE001
+            _log("db_wait", attempt=attempt, error=str(exc)[:120])
+            time.sleep(delay)
+    raise RuntimeError("database not reachable after retries")
 
 
 def cycle_30s() -> None:
@@ -51,6 +67,7 @@ def cycle_15m() -> None:
 
 
 def main() -> None:
+    _wait_for_db()
     init_db()
     _log("worker_start", execution_mode=settings.execution_mode,
          auto_mode_enabled=settings.auto_mode_enabled)
