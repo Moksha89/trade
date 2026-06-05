@@ -1,0 +1,437 @@
+"""Trading orchestration engine.
+
+Ties the layers together for the 24/7 loop:
+  market data → indicators → classifier → AI proposal → risk engine →
+  (approval gate) → execution → live trade management.
+
+All functions take a DB session so they can run from the scheduler worker or be
+triggered manually from the API. Designed for paper mode out of the box; demo/
+live execution is used automatically when Capital.com credentials are present.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from sqlalchemy.orm import Session
+
+from app.ai.engine import propose_trade
+from app.ai.schema import Direction
+from app.classifier.engine import classify_market, is_tradeable
+from app.config import settings
+from app.execution.factory import get_executor
+from app.indicators.engine import compute_indicators
+from app.market_data.factory import get_provider
+from app.models import Trade, TradeIdea
+from app.risk.engine import RiskContext, evaluate_proposal
+from app.services import accounts
+from app.services.audit import log_event
+from app.services.settings_store import AI, RISK, STRATEGY, get_bot_state, get_group
+from app.telegram.notifier import notify
+from app.trade_manager.engine import compute_management_actions
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# --------------------------------------------------------------------------
+# Scan & propose (every 5 minutes)
+# --------------------------------------------------------------------------
+def run_scan(db: Session) -> list[TradeIdea]:
+    risk = get_group(db, RISK)
+    strategy = get_group(db, STRATEGY)
+    ai_cfg = get_group(db, AI)
+    state = get_bot_state(db)
+    provider = get_provider()
+
+    created: list[TradeIdea] = []
+
+    if state.trading_locked:
+        log_event(db, "scan_skipped", {"reason": "trading locked"})
+        return created
+
+    open_now = accounts.open_trades(db)
+    max_active = int(risk.get("max_active_trades", 2))
+    if len(open_now) >= max_active:
+        log_event(db, "scan_skipped", {"reason": "max active trades"})
+        return created
+
+    acct_stats = accounts.stats(db)
+    open_risk = accounts.current_open_risk(db)
+
+    for instrument in risk.get("allowed_instruments", []):
+        if any(t.instrument == instrument for t in open_now):
+            continue
+        try:
+            candles = provider.get_candles(instrument, "5M", 250)
+            ind = compute_indicators(candles)
+            snap = provider.get_snapshot(instrument)
+        except Exception as exc:  # noqa: BLE001
+            log_event(db, "market_data_error", {"error": str(exc)}, instrument=instrument)
+            continue
+
+        spread_too_high = snap.quote.spread_points > float(risk.get("max_spread_points", 5))
+        condition = classify_market(
+            ind, news_risk=False, spread_too_high=spread_too_high
+        )
+        log_event(
+            db,
+            "market_scan",
+            {
+                "classification": condition.value,
+                "price": ind.price,
+                "trend": ind.trend,
+                "rsi": round(ind.rsi, 1),
+                "spread": snap.quote.spread_points,
+            },
+            instrument=instrument,
+        )
+
+        if not is_tradeable(condition):
+            continue
+        if not ai_cfg.get("allow_create_ideas", True):
+            continue
+
+        proposal, payload, phash = propose_trade(
+            instrument,
+            ind,
+            condition,
+            context={
+                "client_sentiment": snap.client_sentiment_long_pct,
+                "news_risk": False,
+                "open_positions": [t.instrument for t in open_now],
+                "existing_exposure_aed": open_risk,
+                "available_risk_budget_aed": float(risk.get("max_combined_open_risk", 100))
+                - open_risk,
+            },
+            model=ai_cfg.get("model"),
+        )
+        log_event(
+            db,
+            "ai_response",
+            {
+                "prompt_hash": phash,
+                "direction": proposal.direction.value,
+                "strategy": proposal.strategy.value,
+                "confidence": proposal.confidence,
+            },
+            instrument=instrument,
+        )
+
+        ctx = RiskContext(
+            account_capital=float(risk.get("account_capital", settings.account_start_capital)),
+            open_trades=[{"instrument": t.instrument} for t in open_now],
+            current_open_risk_aed=open_risk,
+            trades_today=int(acct_stats["trades_today"]),
+            losses_today=int(acct_stats["losses_today"]),
+            realized_pl_today=float(acct_stats["realized_pl_today"]),
+            realized_pl_week=float(acct_stats["realized_pl_week"]),
+            spread_points=snap.quote.spread_points,
+            news_risk=False,
+            market_open=snap.market_open,
+            trading_locked=state.trading_locked,
+        )
+        decision = evaluate_proposal(proposal, ctx, risk, strategy)
+
+        idea = TradeIdea(
+            instrument=instrument,
+            direction=proposal.direction.value,
+            strategy=proposal.strategy.value,
+            entry_type=proposal.entry_type.value,
+            entry_price=proposal.entry_price,
+            stop_loss=proposal.stop_loss,
+            take_profit_1=proposal.take_profit_1,
+            take_profit_2=proposal.take_profit_2,
+            confidence=proposal.confidence,
+            risk_reward=proposal.risk_reward,
+            position_size=decision.computed_size,
+            risk_aed=decision.computed_risk_aed,
+            rationale=proposal.rationale,
+            invalidation_condition=proposal.invalidation_condition,
+            risk_flags=proposal.risk_flags,
+            management_plan=proposal.management_plan.model_dump(),
+            market_classification=condition.value,
+            risk_approved=decision.approved,
+            risk_reason=decision.reason,
+            ai_prompt_hash=phash,
+            status="approved" if decision.approved else "rejected",
+        )
+        db.add(idea)
+        db.flush()
+        created.append(idea)
+
+        log_event(
+            db,
+            "risk_decision",
+            {"approved": decision.approved, "reason": decision.reason, "idea_id": idea.id},
+            instrument=instrument,
+        )
+        state.last_ai_decision = f"{instrument} {proposal.direction.value} ({proposal.strategy.value})"
+        if not decision.approved:
+            state.last_risk_rejection = f"{instrument}: {decision.reason}"
+
+        if decision.approved:
+            notify(
+                f"💡 Trade idea: {instrument} {proposal.direction.value.upper()} "
+                f"{proposal.strategy.value} | entry {proposal.entry_price} SL {proposal.stop_loss} "
+                f"TP {proposal.take_profit_1} | conf {proposal.confidence:.0f}% RR {proposal.risk_reward}"
+            )
+            # Auto-execute only if explicitly enabled (off by default).
+            if (
+                ai_cfg.get("auto_mode")
+                and ai_cfg.get("allow_open_trades")
+                and state.auto_trading_enabled
+                and settings.execution_mode in ("demo", "live", "paper")
+            ):
+                execute_idea(db, idea)
+
+    db.commit()
+    return created
+
+
+# --------------------------------------------------------------------------
+# Execute an approved idea
+# --------------------------------------------------------------------------
+def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
+    if not idea.risk_approved:
+        log_event(db, "execute_blocked", {"idea_id": idea.id, "reason": idea.risk_reason})
+        return None
+    if idea.status == "executed":
+        return None
+
+    executor = get_executor()
+    direction = idea.direction
+    result = executor.open(
+        instrument=idea.instrument,
+        direction=direction,
+        size=idea.position_size,
+        entry_price=idea.entry_price,
+        stop_loss=idea.stop_loss,
+        take_profit=idea.take_profit_1,
+    )
+    if not result.ok:
+        idea.status = "rejected"
+        idea.risk_reason = f"execution failed: {result.error}"
+        log_event(db, "order_failed", {"idea_id": idea.id, "error": result.error},
+                  instrument=idea.instrument)
+        notify(f"⚠️ Order failed for {idea.instrument}: {result.error}")
+        db.commit()
+        return None
+
+    risk_per_unit = abs(idea.entry_price - idea.stop_loss)
+    trade = Trade(
+        idea_id=idea.id,
+        mode=executor.mode,
+        instrument=idea.instrument,
+        direction=direction,
+        strategy=idea.strategy,
+        entry_price=result.fill_price or idea.entry_price,
+        size=idea.position_size,
+        stop_loss=idea.stop_loss,
+        take_profit_1=idea.take_profit_1,
+        take_profit_2=idea.take_profit_2,
+        initial_risk_aed=idea.risk_aed,
+        initial_risk_per_unit=risk_per_unit,
+        current_price=result.fill_price or idea.entry_price,
+        management_plan=idea.management_plan,
+        deal_reference=result.deal_reference,
+        deal_id=result.deal_id,
+        status="open",
+    )
+    db.add(trade)
+    idea.status = "executed"
+    db.flush()
+    log_event(
+        db,
+        "order_created",
+        {"trade_id": trade.id, "deal_id": trade.deal_id, "mode": trade.mode,
+         "size": trade.size, "entry": trade.entry_price},
+        instrument=trade.instrument,
+    )
+    notify(
+        f"✅ Opened {trade.instrument} {direction.upper()} size {trade.size:.4f} "
+        f"@ {trade.entry_price} | SL {trade.stop_loss} TP {trade.take_profit_1} ({trade.mode})"
+    )
+    db.commit()
+    return trade
+
+
+# --------------------------------------------------------------------------
+# Manage open trades (every 30s–1m)
+# --------------------------------------------------------------------------
+def _mark_to_market(trade: Trade, price: float) -> None:
+    trade.current_price = price
+    if trade.direction == "long":
+        trade.unrealized_pl = round(trade.size * (price - trade.entry_price), 2)
+    else:
+        trade.unrealized_pl = round(trade.size * (trade.entry_price - price), 2)
+
+
+def close_trade(db: Session, trade: Trade, price: float, reason: str) -> None:
+    if trade.direction == "long":
+        pl = trade.size * (price - trade.entry_price)
+    else:
+        pl = trade.size * (trade.entry_price - price)
+    trade.realized_pl = round(trade.realized_pl + pl, 2)
+    trade.unrealized_pl = 0.0
+    trade.current_price = price
+    trade.status = "closed"
+    trade.closed_at = _utcnow()
+    trade.close_reason = reason
+    executor = get_executor()
+    executor.close(trade.deal_id, price)
+    log_event(
+        db,
+        "trade_closed",
+        {"trade_id": trade.id, "reason": reason, "realized_pl": trade.realized_pl},
+        instrument=trade.instrument,
+    )
+    notify(f"🔚 Closed {trade.instrument} ({reason}) | P/L {trade.realized_pl:+.2f}")
+
+
+def _partial_close(db: Session, trade: Trade, price: float, pct: float) -> None:
+    closed_size = trade.size * pct / 100.0
+    if trade.direction == "long":
+        pl = closed_size * (price - trade.entry_price)
+    else:
+        pl = closed_size * (trade.entry_price - price)
+    trade.realized_pl = round(trade.realized_pl + pl, 2)
+    trade.size = round(trade.size - closed_size, 6)
+    trade.partial_closed = True
+    log_event(
+        db,
+        "partial_close",
+        {"trade_id": trade.id, "pct": pct, "realized_pl": trade.realized_pl},
+        instrument=trade.instrument,
+    )
+    notify(f"📉 Partial {pct:.0f}% close {trade.instrument} | realized {trade.realized_pl:+.2f}")
+
+
+def manage_open_trades(db: Session) -> None:
+    provider = get_provider()
+    for trade in accounts.open_trades(db):
+        try:
+            quote = provider.get_quote(trade.instrument)
+        except Exception as exc:  # noqa: BLE001
+            log_event(db, "market_data_error", {"error": str(exc)}, instrument=trade.instrument)
+            continue
+        price = quote.mid
+        _mark_to_market(trade, price)
+
+        # Hard stop / target hits (paper simulation; live uses server-side stops).
+        if trade.direction == "long":
+            if price <= trade.stop_loss:
+                close_trade(db, trade, trade.stop_loss, "stop_loss"); db.commit(); continue
+            if trade.take_profit_2 and price >= trade.take_profit_2:
+                close_trade(db, trade, trade.take_profit_2, "take_profit_2"); db.commit(); continue
+        else:
+            if price >= trade.stop_loss:
+                close_trade(db, trade, trade.stop_loss, "stop_loss"); db.commit(); continue
+            if trade.take_profit_2 and price <= trade.take_profit_2:
+                close_trade(db, trade, trade.take_profit_2, "take_profit_2"); db.commit(); continue
+
+        plan = trade.management_plan or {}
+        trail_level = None
+        if trade.partial_closed:
+            try:
+                ind = compute_indicators(provider.get_candles(trade.instrument, "5M", 60))
+                if trade.direction == "long":
+                    trail_level = ind.price - ind.atr
+                else:
+                    trail_level = ind.price + ind.atr
+            except Exception:  # noqa: BLE001
+                trail_level = None
+
+        actions = compute_management_actions(
+            direction=trade.direction,
+            entry=trade.entry_price,
+            current_price=price,
+            risk_per_unit=trade.initial_risk_per_unit,
+            current_sl=trade.stop_loss,
+            plan=plan,
+            breakeven_done=trade.breakeven_moved,
+            profit_locked=trade.profit_locked,
+            partial_done=trade.partial_closed,
+            trail_level=trail_level,
+        )
+
+        # TP1 reached without an explicit +2R partial → take the partial there too.
+        tp1_hit = trade.take_profit_1 and (
+            (trade.direction == "long" and price >= trade.take_profit_1)
+            or (trade.direction == "short" and price <= trade.take_profit_1)
+        )
+        if actions.close:
+            close_trade(db, trade, price, ";".join(actions.reasons) or "managed_close")
+            db.commit()
+            continue
+
+        if actions.new_stop_loss is not None:
+            old = trade.stop_loss
+            trade.stop_loss = actions.new_stop_loss
+            trade.last_sltp_update = _utcnow()
+            if any("breakeven" in r for r in actions.reasons):
+                trade.breakeven_moved = True
+            if any("lock" in r for r in actions.reasons):
+                trade.profit_locked = True
+                trade.breakeven_moved = True
+            get_executor().modify(trade.deal_id, trade.stop_loss, None)
+            log_event(
+                db, "sltp_moved",
+                {"trade_id": trade.id, "old_sl": old, "new_sl": trade.stop_loss,
+                 "reasons": actions.reasons},
+                instrument=trade.instrument,
+            )
+            notify(f"🔧 {trade.instrument} SL → {trade.stop_loss} ({','.join(actions.reasons)})")
+
+        if (actions.partial_close_percent or tp1_hit) and not trade.partial_closed:
+            pct = actions.partial_close_percent or float(plan.get("partial_close_percent", 50))
+            _partial_close(db, trade, price, pct)
+
+        db.commit()
+
+
+# --------------------------------------------------------------------------
+# Health + journal
+# --------------------------------------------------------------------------
+def run_health(db: Session) -> None:
+    state = get_bot_state(db)
+    state.last_heartbeat = _utcnow()
+    # Broker connectivity (paper mode reports disconnected by design).
+    connected = False
+    if settings.execution_mode != "paper":
+        from app.broker.capital import CapitalClient
+
+        client = CapitalClient()
+        if client.configured:
+            try:
+                client.ensure_session()
+                connected = True
+            except Exception:  # noqa: BLE001
+                connected = False
+    state.broker_connected = connected
+    db.commit()
+
+
+def save_journal(db: Session) -> None:
+    from app.models import JournalSnapshot
+
+    s = accounts.stats(db)
+    snapshot = {
+        "ts": _utcnow().isoformat(),
+        **s,
+        "current_open_risk": accounts.current_open_risk(db),
+        "open_trades": [
+            {
+                "instrument": t.instrument,
+                "direction": t.direction,
+                "entry": t.entry_price,
+                "sl": t.stop_loss,
+                "unrealized_pl": t.unrealized_pl,
+            }
+            for t in accounts.open_trades(db)
+        ],
+    }
+    db.add(JournalSnapshot(snapshot=snapshot))
+    log_event(db, "journal_snapshot", {"open_trades": s["open_trades_count"]})
+    db.commit()
