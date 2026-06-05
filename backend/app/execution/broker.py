@@ -42,8 +42,13 @@ class BrokerExecutor:
                 "dealId"
             )
             # Verify server-side stop is attached; otherwise abort and close.
+            # /confirms does not always echo stopLevel, so fall back to reading
+            # the live position before deciding there is no stop.
             level = confirm.get("level") or entry_price
-            if not confirm.get("stopLevel"):
+            has_stop = confirm.get("stopLevel") is not None
+            if not has_stop and deal_id:
+                has_stop = self.client.position_has_stop(deal_id)
+            if not has_stop:
                 if deal_id:
                     try:
                         self.client.close_position(deal_id)

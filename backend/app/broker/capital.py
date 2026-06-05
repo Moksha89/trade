@@ -249,5 +249,21 @@ class CapitalClient:
             raise CapitalError(f"positions failed: {resp.status_code} {resp.text}")
         return resp.json().get("positions", [])
 
+    def position_has_stop(self, deal_id: str) -> bool:
+        """Authoritatively check a position carries a server-side stop.
+
+        The /confirms payload does not always echo `stopLevel`, so we read the
+        live position and look for a stop on the position node. Returns False if
+        the position cannot be found or carries no stop.
+        """
+        try:
+            for row in self.get_positions():
+                pos = row.get("position", row)
+                if str(pos.get("dealId")) == str(deal_id):
+                    return pos.get("stopLevel") is not None
+        except CapitalError:
+            return False
+        return False
+
     def close(self) -> None:
         self._client.close()
