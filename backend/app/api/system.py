@@ -10,7 +10,7 @@ from app.auth.security import get_current_user
 from app.config import settings
 from app.db import get_db
 from app.services import accounts
-from app.services.settings_store import RISK, get_bot_state, get_group
+from app.services.settings_store import BROKER_RUNTIME, RISK, get_bot_state, get_group
 
 router = APIRouter(tags=["system"])
 
@@ -32,20 +32,33 @@ def dashboard_status(
 ) -> dict:
     state = get_bot_state(db)
     risk = get_group(db, RISK)
+    broker_rt = get_group(db, BROKER_RUNTIME)
     s = accounts.stats(db)
     daily_limit = float(risk.get("daily_loss_limit", 150))
     loss_today = max(0.0, -float(s["realized_pl_today"]))
+    # Prefer the live broker balance when connected; otherwise the configured
+    # (paper) account capital.
+    paper_capital = float(risk.get("account_capital", settings.account_start_capital))
+    live_balance = broker_rt.get("balance")
+    live_available = broker_rt.get("available")
+    broker_live = bool(broker_rt.get("connected")) and live_balance is not None
+    account_balance = float(live_balance) if broker_live else paper_capital
+    available_funds = (
+        float(live_available)
+        if broker_live and live_available is not None
+        else paper_capital + float(s["realized_pl_today"])
+    )
     return {
         "bot_running": state.bot_running,
         "execution_mode": settings.execution_mode,
         "auto_mode_enabled": state.auto_trading_enabled,
         "hedging_enabled": settings.hedging_enabled,
         "broker_connected": state.broker_connected,
+        "broker_environment": broker_rt.get("environment", settings.capital_environment),
         "trading_locked": state.trading_locked,
         "lock_reason": state.lock_reason,
-        "account_balance": float(risk.get("account_capital", settings.account_start_capital)),
-        "available_funds": float(risk.get("account_capital", settings.account_start_capital))
-        + float(s["realized_pl_today"]),
+        "account_balance": account_balance,
+        "available_funds": available_funds,
         "today_pl": float(s["realized_pl_today"]),
         "weekly_pl": float(s["realized_pl_week"]),
         "open_trades_count": int(s["open_trades_count"]),

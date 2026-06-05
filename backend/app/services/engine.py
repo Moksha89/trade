@@ -26,7 +26,15 @@ from app.models import Trade, TradeIdea
 from app.risk.engine import RiskContext, evaluate_proposal
 from app.services import accounts
 from app.services.audit import log_event
-from app.services.settings_store import AI, RISK, STRATEGY, get_bot_state, get_group
+from app.services.settings_store import (
+    AI,
+    BROKER_RUNTIME,
+    RISK,
+    STRATEGY,
+    get_bot_state,
+    get_group,
+    update_group,
+)
 from app.telegram.notifier import notify
 from app.trade_manager.engine import compute_management_actions
 
@@ -446,18 +454,37 @@ def manage_open_trades(db: Session) -> None:
 def run_health(db: Session) -> None:
     state = get_bot_state(db)
     state.last_heartbeat = _utcnow()
-    # Broker connectivity (paper mode reports disconnected by design).
+    # Read-only broker connectivity. We authenticate and read the balance
+    # whenever credentials are configured, regardless of execution mode, so the
+    # dashboard can show a live connection without ever placing an order
+    # (order routing is gated separately by EXECUTION_MODE in the executor).
     connected = False
-    if settings.execution_mode != "paper":
-        from app.broker.capital import CapitalClient
+    from app.broker.capital import CapitalClient
 
-        client = CapitalClient()
-        if client.configured:
+    client = CapitalClient()
+    if client.configured:
+        try:
+            client.ensure_session()
+            connected = True
             try:
-                client.ensure_session()
-                connected = True
+                bal = client.get_account_balance()
+                update_group(
+                    db,
+                    BROKER_RUNTIME,
+                    {
+                        "connected": True,
+                        "environment": settings.capital_environment,
+                        "balance": bal.get("balance"),
+                        "available": bal.get("available"),
+                        "synced_at": _utcnow().isoformat(),
+                    },
+                )
             except Exception:  # noqa: BLE001
-                connected = False
+                pass
+        except Exception:  # noqa: BLE001
+            connected = False
+    if not connected:
+        update_group(db, BROKER_RUNTIME, {"connected": False})
     state.broker_connected = connected
     db.commit()
 

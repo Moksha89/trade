@@ -16,6 +16,17 @@ from app.models import BotState, SettingRow
 RISK = "risk"
 STRATEGY = "strategy"
 AI = "ai"
+BROKER_RUNTIME = "broker_runtime"
+
+
+def default_broker_runtime() -> dict[str, Any]:
+    return {
+        "connected": False,
+        "environment": env.capital_environment,
+        "balance": None,
+        "available": None,
+        "synced_at": None,
+    }
 
 
 def default_risk() -> dict[str, Any]:
@@ -72,7 +83,12 @@ def default_ai() -> dict[str, Any]:
     }
 
 
-_DEFAULTS = {RISK: default_risk, STRATEGY: default_strategy, AI: default_ai}
+_DEFAULTS = {
+    RISK: default_risk,
+    STRATEGY: default_strategy,
+    AI: default_ai,
+    BROKER_RUNTIME: default_broker_runtime,
+}
 
 
 def seed_defaults(db: Session) -> None:

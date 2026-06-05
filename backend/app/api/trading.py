@@ -22,6 +22,7 @@ from app.services import accounts, emergency, engine
 from app.services.audit import log_event
 from app.services.settings_store import (
     AI,
+    BROKER_RUNTIME,
     RISK,
     STRATEGY,
     get_bot_state,
@@ -233,12 +234,17 @@ def broker_status(db: Session = Depends(get_db)) -> dict:
 
     client = CapitalClient()
     state = get_bot_state(db)
+    broker_rt = get_group(db, BROKER_RUNTIME)
     info: dict[str, Any] = {
         "environment": settings.capital_environment,
         "configured": client.configured,
         "connected": state.broker_connected,
         "identifier_set": bool(settings.capital_identifier),
         "api_key_set": bool(settings.capital_api_key),
+        "execution_mode": settings.execution_mode,
+        "balance": broker_rt.get("balance"),
+        "available": broker_rt.get("available"),
+        "synced_at": broker_rt.get("synced_at"),
     }
     return info
 
