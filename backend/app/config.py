@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     # AI providers
     ai_provider: str = "claude"
     anthropic_api_key: str = ""
-    anthropic_model: str = "claude-3-5-sonnet-latest"
+    anthropic_model: str = "claude-sonnet-4-5-20250929"
     openai_api_key: str = ""
     ai_min_confidence: int = 70
 

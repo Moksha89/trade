@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from app.ai.engine import propose_trade
-from app.ai.schema import Direction
+from app.ai.schema import Direction, EntryType, ManagementPlan, Strategy, TradeProposal
 from app.classifier.engine import classify_market, is_tradeable
 from app.config import settings
 from app.execution.factory import get_executor
@@ -193,12 +193,59 @@ def run_scan(db: Session) -> list[TradeIdea]:
 # --------------------------------------------------------------------------
 # Execute an approved idea
 # --------------------------------------------------------------------------
+def _proposal_from_idea(idea: TradeIdea) -> TradeProposal:
+    return TradeProposal(
+        instrument=idea.instrument,
+        direction=Direction(idea.direction),
+        strategy=Strategy(idea.strategy),
+        entry_type=EntryType(idea.entry_type),
+        entry_price=idea.entry_price,
+        stop_loss=idea.stop_loss,
+        take_profit_1=idea.take_profit_1,
+        take_profit_2=idea.take_profit_2,
+        confidence=idea.confidence,
+        risk_reward=idea.risk_reward,
+        management_plan=ManagementPlan(**(idea.management_plan or {})),
+    )
+
+
 def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
     if not idea.risk_approved:
         log_event(db, "execute_blocked", {"idea_id": idea.id, "reason": idea.risk_reason})
         return None
     if idea.status == "executed":
         return None
+
+    # Re-validate against the CURRENT state — conditions may have changed since the
+    # proposal was made (other trades opened, losses hit limits, etc.). The risk
+    # engine is the final authority at execution time, not just at proposal time.
+    risk = get_group(db, RISK)
+    strategy = get_group(db, STRATEGY)
+    state = get_bot_state(db)
+    open_now = accounts.open_trades(db)
+    acct_stats = accounts.stats(db)
+    ctx = RiskContext(
+        account_capital=float(risk.get("account_capital", settings.account_start_capital)),
+        open_trades=[{"instrument": t.instrument} for t in open_now],
+        current_open_risk_aed=accounts.current_open_risk(db),
+        trades_today=int(acct_stats["trades_today"]),
+        losses_today=int(acct_stats["losses_today"]),
+        realized_pl_today=float(acct_stats["realized_pl_today"]),
+        realized_pl_week=float(acct_stats["realized_pl_week"]),
+        market_open=True,
+        trading_locked=state.trading_locked,
+    )
+    recheck = evaluate_proposal(_proposal_from_idea(idea), ctx, risk, strategy)
+    if not recheck.approved:
+        idea.status = "rejected"
+        idea.risk_reason = f"blocked at execution: {recheck.reason}"
+        log_event(db, "execute_blocked", {"idea_id": idea.id, "reason": recheck.reason},
+                  instrument=idea.instrument)
+        db.commit()
+        return None
+    # Use the freshly computed authoritative size.
+    idea.position_size = recheck.computed_size
+    idea.risk_aed = recheck.computed_risk_aed
 
     executor = get_executor()
     direction = idea.direction

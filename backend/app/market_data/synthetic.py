@@ -8,6 +8,7 @@ the demo shows a mix of bullish, bearish, and ranging behaviour.
 
 from __future__ import annotations
 
+import math
 import random
 import time
 
@@ -29,15 +30,20 @@ class SyntheticProvider:
     def __init__(self, seed: int = 7) -> None:
         self._seed = seed
 
+    # Canonical history length so the most-recent price is identical regardless
+    # of how many bars a caller requests (the tail is always the same walk).
+    _CANON = 600
+
     def _history(self, instrument: str, count: int) -> list[float]:
         base, drift, vol, _ = _PROFILES.get(instrument, (100.0, 0.2, 1.0, 1.0))
+        length = max(count, self._CANON)
         rng = random.Random(hash((instrument, self._seed)) & 0xFFFFFFFF)
         price = base
         prices = []
-        for _ in range(count):
+        for _ in range(length):
             price = max(price + drift + rng.gauss(0, vol), base * 0.5)
             prices.append(price)
-        return prices
+        return prices[-count:]
 
     def get_candles(self, instrument: str, resolution: str, count: int) -> list[Candle]:
         prices = self._history(instrument, count)
@@ -60,8 +66,12 @@ class SyntheticProvider:
 
     def get_quote(self, instrument: str) -> Quote:
         candles = self.get_candles(instrument, "MINUTE", 5)
-        mid = candles[-1].close
-        _, _, _, spread = _PROFILES.get(instrument, (100.0, 0.2, 1.0, 1.0))
+        last = candles[-1].close
+        _, _, vol, spread = _PROFILES.get(instrument, (100.0, 0.2, 1.0, 1.0))
+        # Live-tick oscillation so paper trades evolve between polls. Bounded so
+        # it stays within a realistic band around the last canonical close.
+        wobble = math.sin(time.time() / 17.0 + hash(instrument) % 7) * vol * 0.5
+        mid = last + wobble
         half = spread / 2.0
         return Quote(
             instrument=instrument,

@@ -34,7 +34,7 @@ class BotState(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     bot_running: Mapped[bool] = mapped_column(Boolean, default=False)
     auto_trading_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    trading_locked_today: Mapped[bool] = mapped_column(Boolean, default=False)
+    trading_locked: Mapped[bool] = mapped_column(Boolean, default=False)
     lock_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     broker_connected: Mapped[bool] = mapped_column(Boolean, default=False)
     last_ai_decision: Mapped[str | None] = mapped_column(String(255), nullable=True)
