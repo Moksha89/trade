@@ -1,0 +1,68 @@
+# AI Trading System — Docker Compose (Phase 0).
+#
+# Only nginx is published to the host (port 80). The dashboard, API, worker,
+# database, and Redis are reachable only on the internal Docker network and are
+# never exposed publicly, per the build spec's VPS security model.
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      - api
+      - frontend
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    expose:
+      - "3000"
+    environment:
+      NODE_ENV: production
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./backend
+    env_file:
+      - .env
+    expose:
+      - "8000"
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./backend
+    command: ["python", "-m", "app.worker"]
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-trading}
+      POSTGRES_USER: ${POSTGRES_USER:-trading}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_strong}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # No ports published: database is internal only.
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # No ports published: Redis is internal only.
+    restart: unless-stopped
+
+volumes:
+  pgdata:
