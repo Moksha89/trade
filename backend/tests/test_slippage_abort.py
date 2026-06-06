@@ -25,7 +25,7 @@ FX = 3.6725  # AED per 1-point move (size 1)
 class _Provider:
     def get_quote(self, instrument):
         # We size the long against ask = 100 → risk/unit 1.0.
-        return type("Q", (), {"ask": 100.0, "bid": 100.0, "mid": 100.0})()
+        return type("Q", (), {"ask": 100.0, "bid": 100.0, "mid": 100.0, "spread_points": 0.0})()
 
     def risk_unit_multiplier(self, instrument):
         return FX

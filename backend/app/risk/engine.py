@@ -129,6 +129,19 @@ def evaluate_proposal(
     if ctx.spread_points > max_spread:
         return reject(f"Spread {ctx.spread_points} above max {max_spread}")
 
+    # 8b. Stop must be wide enough relative to the spread. A stop only ~1x the
+    # spread means the spread (and the slippage that comes with it) eats most of
+    # the risk budget — this is exactly what wrecked the first crypto trades: a
+    # tight stop on a wide-spread pair fills away from the quote and the real
+    # risk blows past the per-trade cap. Require the stop distance to be a
+    # multiple of the current spread so only setups with room to breathe pass.
+    min_stop_spread = float(risk.get("min_stop_to_spread_ratio", 3.0))
+    if ctx.spread_points > 0 and risk_per_unit < min_stop_spread * ctx.spread_points:
+        return reject(
+            f"Stop distance {risk_per_unit:.4g} too tight vs spread "
+            f"{ctx.spread_points:.4g} (need ≥{min_stop_spread:g}x spread)"
+        )
+
     # 9. Daily / weekly loss limits.
     daily_limit = float(risk.get("daily_loss_limit", 150))
     if -ctx.realized_pl_today >= daily_limit:

@@ -136,3 +136,21 @@ def test_bearish_disabled_blocks_short():
     )
     d = evaluate_proposal(short, _ctx(), RISK, strat)
     assert not d.approved and "Bearish" in d.reason
+
+
+def test_stop_too_tight_vs_spread_rejected():
+    # risk_per_unit = 1.0; spread 0.5 -> need stop >= 3 x 0.5 = 1.5 -> reject.
+    d = evaluate_proposal(_long(), _ctx(spread_points=0.5), RISK, STRAT)
+    assert not d.approved and "too tight vs spread" in d.reason
+
+
+def test_stop_wide_enough_vs_spread_approved():
+    # risk_per_unit = 1.0; spread 0.2 -> need stop >= 0.6 -> 1.0 passes.
+    d = evaluate_proposal(_long(), _ctx(spread_points=0.2), RISK, STRAT)
+    assert d.approved
+
+
+def test_zero_spread_skips_ratio_gate():
+    # No live spread (0.0) must not block — gate only applies when known.
+    d = evaluate_proposal(_long(), _ctx(spread_points=0.0), RISK, STRAT)
+    assert d.approved

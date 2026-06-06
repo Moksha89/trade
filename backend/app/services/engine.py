@@ -241,26 +241,30 @@ def _proposal_from_idea(idea: TradeIdea, entry_price: float | None = None) -> Tr
     )
 
 
-def _execution_entry_price(provider: MarketDataProvider, idea: TradeIdea) -> float:
-    """Price to size a market order against at execution time.
+def _execution_entry_and_spread(
+    provider: MarketDataProvider, idea: TradeIdea
+) -> tuple[float, float]:
+    """Live execution price and spread for sizing/gating at execution time.
 
     The AI's proposed entry is stale by the time we execute; on wide-spread
     instruments (crypto) the real fill can be far from it, which would inflate
     the stop distance and blow past the per-trade risk cap. For market entries
     we size against the live executable price (ask for longs, bid for shorts),
     so realized risk reflects the actual fill. Limit/stop entries fill at their
-    own level, so we keep the proposed price. Falls back to the proposed entry
-    if no live quote is available.
+    own level, so we keep the proposed price. The spread (ask-bid) is returned
+    so the risk engine can reject setups whose stop is too tight versus it.
+    Falls back to the proposed entry (and zero spread) if no live quote.
     """
-    if idea.entry_type != EntryType.MARKET.value:
-        return idea.entry_price
     try:
         q = provider.get_quote(idea.instrument)
     except Exception:  # noqa: BLE001
-        return idea.entry_price
+        return idea.entry_price, 0.0
+    spread = q.spread_points or abs((q.ask or 0.0) - (q.bid or 0.0))
+    if idea.entry_type != EntryType.MARKET.value:
+        return idea.entry_price, spread
     if idea.direction == Direction.LONG.value:
-        return q.ask or idea.entry_price
-    return q.bid or idea.entry_price
+        return (q.ask or idea.entry_price), spread
+    return (q.bid or idea.entry_price), spread
 
 
 def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
@@ -292,8 +296,10 @@ def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
         account_ccy_per_point=_risk_unit_multiplier(provider, idea.instrument),
     )
     # Size against the live executable price so wide-spread fills can't blow
-    # past the per-trade risk cap (the proposed entry is stale by now).
-    exec_entry = _execution_entry_price(provider, idea)
+    # past the per-trade risk cap (the proposed entry is stale by now). The
+    # live spread feeds the stop-vs-spread quality gate in the risk engine.
+    exec_entry, exec_spread = _execution_entry_and_spread(provider, idea)
+    ctx.spread_points = exec_spread
     recheck = evaluate_proposal(_proposal_from_idea(idea, exec_entry), ctx, risk, strategy)
     if not recheck.approved:
         idea.status = "rejected"

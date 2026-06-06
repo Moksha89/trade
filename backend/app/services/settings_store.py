@@ -42,6 +42,7 @@ def default_risk() -> dict[str, Any]:
         "min_confidence": env.ai_min_confidence,
         "allowed_instruments": ["US100", "US500", "Gold"],
         "max_spread_points": 5.0,
+        "min_stop_to_spread_ratio": 3.0,
         "max_sl_distance_pct": 2.0,
         "news_filter_enabled": True,
         "market_hours_filter_enabled": True,
