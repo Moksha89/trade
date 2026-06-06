@@ -4,10 +4,47 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.services import accounts, engine
 from app.services.audit import log_event
-from app.services.settings_store import AI, get_bot_state, update_group
+from app.services.settings_store import AI, RISK, get_bot_state, update_group
 from app.telegram.notifier import notify
+
+
+def sync_broker_hedging_mode(enabled: bool) -> bool | None:
+    """Best-effort sync of the broker account's hedging mode to our setting.
+
+    Returns the resulting broker mode, or None when not applicable (paper mode)
+    or on a broker error — callers treat None as "couldn't confirm" and never
+    crash the request over it. Real hedging is impossible unless the broker
+    account is in hedging mode (otherwise opposing orders net out).
+    """
+    if settings.execution_mode == "paper":
+        return None
+    try:
+        from app.broker.capital import get_capital_client
+
+        client = get_capital_client()
+        client.ensure_session()
+        return client.set_hedging_mode(enabled)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def set_hedging(db: Session, enabled: bool) -> bool | None:
+    """Flip the hedging setting (DB) and sync the broker account mode."""
+    update_group(db, RISK, {"hedging_enabled": enabled})
+    broker_mode = sync_broker_hedging_mode(enabled)
+    db.commit()
+    log_event(
+        db,
+        "settings_updated",
+        {"group": "risk", "keys": ["hedging_enabled"],
+         "hedging_enabled": enabled, "broker_hedging_mode": broker_mode},
+    )
+    notify(f"{'🛡️ Hedging enabled' if enabled else '🚫 Hedging disabled'}"
+           f" (broker mode: {broker_mode})")
+    return broker_mode
 
 
 def stop_bot(db: Session) -> None:
@@ -64,8 +101,8 @@ def close_all_positions(db: Session) -> int:
 
 
 def disable_hedging(db: Session) -> None:
+    set_hedging(db, False)
     log_event(db, "emergency_stop", {"action": "disable_hedging"})
-    notify("🚫 Hedging disabled")
 
 
 def disconnect_broker(db: Session) -> None:

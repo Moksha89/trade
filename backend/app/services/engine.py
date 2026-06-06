@@ -152,7 +152,7 @@ def run_scan(db: Session) -> list[TradeIdea]:
 
         ctx = RiskContext(
             account_capital=float(risk.get("account_capital", settings.account_start_capital)),
-            open_trades=[{"instrument": t.instrument} for t in open_now],
+            open_trades=[{"instrument": t.instrument, "direction": t.direction} for t in open_now],
             current_open_risk_aed=open_risk,
             trades_today=int(acct_stats["trades_today"]),
             losses_today=int(acct_stats["losses_today"]),
@@ -285,7 +285,7 @@ def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
     provider = get_provider()
     ctx = RiskContext(
         account_capital=float(risk.get("account_capital", settings.account_start_capital)),
-        open_trades=[{"instrument": t.instrument} for t in open_now],
+        open_trades=[{"instrument": t.instrument, "direction": t.direction} for t in open_now],
         current_open_risk_aed=accounts.current_open_risk(db),
         trades_today=int(acct_stats["trades_today"]),
         losses_today=int(acct_stats["losses_today"]),

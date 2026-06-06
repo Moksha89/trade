@@ -307,6 +307,27 @@ class CapitalClient:
             return False
         return False
 
+    def get_hedging_mode(self) -> bool:
+        """Whether the account holds opposing positions as separate hedges.
+
+        When false (netting), opening a short against an open long reduces/closes
+        the long instead of creating a hedge — so real hedging requires this on.
+        """
+        resp = self._request("GET", "/api/v1/accounts/preferences")
+        if resp.status_code != 200:
+            raise CapitalError(f"preferences read failed: {resp.status_code} {resp.text}")
+        return bool(resp.json().get("hedgingMode", False))
+
+    def set_hedging_mode(self, enabled: bool) -> bool:
+        """Enable/disable account hedging mode. Requires no conflicting open
+        positions broker-side. Returns the resulting mode."""
+        resp = self._request(
+            "PUT", "/api/v1/accounts/preferences", json={"hedgingMode": bool(enabled)}
+        )
+        if resp.status_code != 200:
+            raise CapitalError(f"set hedging mode failed: {resp.status_code} {resp.text}")
+        return self.get_hedging_mode()
+
     def close(self) -> None:
         self._client.close()
 

@@ -165,9 +165,21 @@ def evaluate_proposal(
     if len(ctx.open_trades) >= max_active:
         return reject(f"Already {len(ctx.open_trades)} active trades (max {max_active})")
 
-    # 13. No duplicate instrument.
-    if any(t.get("instrument") == proposal.instrument for t in ctx.open_trades):
-        return reject(f"Duplicate trade on {proposal.instrument}")
+    # 13. Same-instrument guard. With hedging off, block any second position on
+    # the instrument. With hedging on, allow an opposing-direction position (a
+    # hedge) but still block a same-direction one — averaging/pyramiding into a
+    # position is never allowed.
+    hedging = bool(risk.get("hedging_enabled", False))
+    for t in ctx.open_trades:
+        if t.get("instrument") != proposal.instrument:
+            continue
+        same_dir = t.get("direction") == proposal.direction.value
+        if same_dir or not hedging:
+            kind = "Duplicate" if same_dir else "Existing"
+            return reject(
+                f"{kind} position on {proposal.instrument} "
+                f"(hedging {'on' if hedging else 'off'})"
+            )
 
     # 14. Position sizing from risk budget and combined-risk cap.
     max_risk_trade = float(risk.get("max_risk_per_trade", 50))

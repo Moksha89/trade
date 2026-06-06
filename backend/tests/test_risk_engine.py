@@ -59,9 +59,44 @@ def test_max_active_trades_enforced():
     assert not d.approved and "active trades" in d.reason
 
 
+def _short(entry=100.0, sl=101.0, tp=98.0, conf=80.0, instrument="US100"):
+    return TradeProposal(
+        instrument=instrument,
+        direction=Direction.SHORT,
+        strategy=Strategy.TREND_PULLBACK,
+        entry_type=EntryType.MARKET,
+        entry_price=entry,
+        stop_loss=sl,
+        take_profit_1=tp,
+        confidence=conf,
+    )
+
+
 def test_duplicate_instrument_rejected():
-    ctx = _ctx(open_trades=[{"instrument": "US100"}])
+    ctx = _ctx(open_trades=[{"instrument": "US100", "direction": "long"}])
     d = evaluate_proposal(_long(), ctx, RISK, STRAT)
+    assert not d.approved and "Duplicate" in d.reason
+
+
+def test_opposing_instrument_rejected_when_hedging_off():
+    risk = {**RISK, "hedging_enabled": False}
+    ctx = _ctx(open_trades=[{"instrument": "US100", "direction": "long"}])
+    d = evaluate_proposal(_short(), ctx, risk, STRAT)
+    assert not d.approved and "Existing position" in d.reason
+
+
+def test_opposing_instrument_allowed_when_hedging_on():
+    risk = {**RISK, "hedging_enabled": True}
+    ctx = _ctx(open_trades=[{"instrument": "US100", "direction": "long"}])
+    d = evaluate_proposal(_short(), ctx, risk, STRAT)
+    assert d.approved
+
+
+def test_same_direction_blocked_even_when_hedging_on():
+    # Hedging allows the opposite side only — never averaging into the same side.
+    risk = {**RISK, "hedging_enabled": True}
+    ctx = _ctx(open_trades=[{"instrument": "US100", "direction": "long"}])
+    d = evaluate_proposal(_long(), ctx, risk, STRAT)
     assert not d.approved and "Duplicate" in d.reason
 
 

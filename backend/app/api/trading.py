@@ -183,7 +183,15 @@ def put_settings(group: str, patch: dict[str, Any] = Body(...), db: Session = De
     if group not in (RISK, STRATEGY, AI):
         raise HTTPException(404, "unknown settings group")
     merged = update_group(db, group, patch)
-    log_event(db, "settings_updated", {"group": group, "keys": list(patch.keys())})
+    broker_hedging = None
+    if group == RISK and "hedging_enabled" in patch:
+        # Real hedging needs the broker account in hedging mode; sync it so the
+        # panel toggle actually changes broker behavior (not just the label).
+        broker_hedging = emergency.sync_broker_hedging_mode(bool(patch["hedging_enabled"]))
+    log_event(
+        db, "settings_updated",
+        {"group": group, "keys": list(patch.keys()), "broker_hedging_mode": broker_hedging},
+    )
     return merged
 
 

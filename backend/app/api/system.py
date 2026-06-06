@@ -52,7 +52,7 @@ def dashboard_status(
         "bot_running": state.bot_running,
         "execution_mode": settings.execution_mode,
         "auto_mode_enabled": state.auto_trading_enabled,
-        "hedging_enabled": settings.hedging_enabled,
+        "hedging_enabled": bool(risk.get("hedging_enabled", settings.hedging_enabled)),
         "broker_connected": state.broker_connected,
         "broker_environment": broker_rt.get("environment", settings.capital_environment),
         "trading_locked": state.trading_locked,

@@ -44,6 +44,7 @@ def default_risk() -> dict[str, Any]:
         "max_spread_points": 5.0,
         "min_stop_to_spread_ratio": 3.0,
         "max_sl_distance_pct": 2.0,
+        "hedging_enabled": env.hedging_enabled,
         "news_filter_enabled": True,
         "market_hours_filter_enabled": True,
         "account_capital": env.account_start_capital,
