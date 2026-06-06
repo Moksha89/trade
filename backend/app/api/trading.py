@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException
@@ -63,11 +64,28 @@ def bot_stop(db: Session = Depends(get_db)) -> dict:
     return {"bot_running": False}
 
 
+def _run_scan_background() -> None:
+    """Run a full universe scan on its own DB session (off the request path)."""
+    from app.db import SessionLocal
+
+    db = SessionLocal()
+    try:
+        engine.run_scan(db)
+    finally:
+        db.close()
+
+
 @router.post("/bot/scan")
-def bot_scan(db: Session = Depends(get_db)) -> dict:
-    """Trigger a scan/propose cycle immediately (manual)."""
-    ideas = engine.run_scan(db)
-    return {"created": [idea_to_dict(i) for i in ideas]}
+def bot_scan() -> dict:
+    """Trigger a scan/propose cycle immediately (manual).
+
+    A full scan iterates the whole instrument universe and calls the AI for
+    each, which takes far longer than the gateway timeout. So we kick it off in
+    a background thread and return right away; results land via the normal
+    ideas/trades feeds.
+    """
+    threading.Thread(target=_run_scan_background, daemon=True).start()
+    return {"started": True}
 
 
 @router.post("/bot/manage")
