@@ -218,13 +218,13 @@ def run_scan(db: Session) -> list[TradeIdea]:
 # --------------------------------------------------------------------------
 # Execute an approved idea
 # --------------------------------------------------------------------------
-def _proposal_from_idea(idea: TradeIdea) -> TradeProposal:
+def _proposal_from_idea(idea: TradeIdea, entry_price: float | None = None) -> TradeProposal:
     return TradeProposal(
         instrument=idea.instrument,
         direction=Direction(idea.direction),
         strategy=Strategy(idea.strategy),
         entry_type=EntryType(idea.entry_type),
-        entry_price=idea.entry_price,
+        entry_price=idea.entry_price if entry_price is None else entry_price,
         stop_loss=idea.stop_loss,
         take_profit_1=idea.take_profit_1,
         take_profit_2=idea.take_profit_2,
@@ -232,6 +232,28 @@ def _proposal_from_idea(idea: TradeIdea) -> TradeProposal:
         risk_reward=idea.risk_reward,
         management_plan=ManagementPlan(**(idea.management_plan or {})),
     )
+
+
+def _execution_entry_price(provider: MarketDataProvider, idea: TradeIdea) -> float:
+    """Price to size a market order against at execution time.
+
+    The AI's proposed entry is stale by the time we execute; on wide-spread
+    instruments (crypto) the real fill can be far from it, which would inflate
+    the stop distance and blow past the per-trade risk cap. For market entries
+    we size against the live executable price (ask for longs, bid for shorts),
+    so realized risk reflects the actual fill. Limit/stop entries fill at their
+    own level, so we keep the proposed price. Falls back to the proposed entry
+    if no live quote is available.
+    """
+    if idea.entry_type != EntryType.MARKET.value:
+        return idea.entry_price
+    try:
+        q = provider.get_quote(idea.instrument)
+    except Exception:  # noqa: BLE001
+        return idea.entry_price
+    if idea.direction == Direction.LONG.value:
+        return q.ask or idea.entry_price
+    return q.bid or idea.entry_price
 
 
 def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
@@ -262,7 +284,10 @@ def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
         trading_locked=state.trading_locked,
         account_ccy_per_point=_risk_unit_multiplier(provider, idea.instrument),
     )
-    recheck = evaluate_proposal(_proposal_from_idea(idea), ctx, risk, strategy)
+    # Size against the live executable price so wide-spread fills can't blow
+    # past the per-trade risk cap (the proposed entry is stale by now).
+    exec_entry = _execution_entry_price(provider, idea)
+    recheck = evaluate_proposal(_proposal_from_idea(idea, exec_entry), ctx, risk, strategy)
     if not recheck.approved:
         idea.status = "rejected"
         idea.risk_reason = f"blocked at execution: {recheck.reason}"
@@ -280,7 +305,7 @@ def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
         instrument=idea.instrument,
         direction=direction,
         size=idea.position_size,
-        entry_price=idea.entry_price,
+        entry_price=exec_entry,
         stop_loss=idea.stop_loss,
         take_profit=idea.take_profit_1,
     )
@@ -293,7 +318,7 @@ def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
         db.commit()
         return None
 
-    risk_per_unit = abs(idea.entry_price - idea.stop_loss)
+    risk_per_unit = abs(exec_entry - idea.stop_loss)
     trade = Trade(
         idea_id=idea.id,
         mode=executor.mode,
