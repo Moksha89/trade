@@ -35,8 +35,11 @@ class BrokerExecutor:
             confirm = self.client.confirm(deal_ref)
             status = confirm.get("dealStatus") or confirm.get("status")
             if status not in ("ACCEPTED", "OPEN"):
+                reason = confirm.get("reason") or confirm.get("rejectReason") or "unknown"
                 return ExecutionResult(
-                    ok=False, error=f"deal not accepted: {status}", deal_reference=deal_ref
+                    ok=False,
+                    error=f"deal not accepted: {status} ({reason})",
+                    deal_reference=deal_ref,
                 )
             deal_id = confirm.get("affectedDeals", [{}])[0].get("dealId") or confirm.get(
                 "dealId"
