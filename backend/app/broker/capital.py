@@ -154,15 +154,22 @@ class CapitalClient:
         return self._meta_cache[epic]
 
     def risk_unit_multiplier(self, instrument: str) -> float:
+        """Account-currency value of a 1-point move for a size-1 position.
+
+        Returns 0.0 when it cannot be determined (unknown quote currency with no
+        FX rate, or a transient broker error). Callers treat a non-positive
+        multiplier as "cannot size" and skip the trade, so a wrongly-sized order
+        in an unsupported currency can never be placed.
+        """
         from app.services.fx import quote_to_account
 
         try:
             quote_ccy, lot = self.instrument_meta(instrument)
             fx = quote_to_account(quote_ccy, self.account_currency())
         except CapitalError:
-            return 1.0
+            return 0.0
         if fx is None:
-            return 1.0
+            return 0.0
         return fx * lot
 
     def get_candles(self, instrument: str, resolution: str, count: int) -> list[Candle]:

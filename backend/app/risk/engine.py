@@ -165,6 +165,8 @@ def evaluate_proposal(
     risk_budget = min(max_risk_trade, remaining_combined)
     # Convert the per-unit stop distance (quote currency) into account currency
     # so the AED risk budget sizes the position correctly.
+    if ctx.account_ccy_per_point <= 0:
+        return reject("Cannot size: unverified currency conversion for instrument")
     risk_per_unit_acct = risk_per_unit * ctx.account_ccy_per_point
     if risk_per_unit_acct <= 0:
         return reject("Zero stop distance")

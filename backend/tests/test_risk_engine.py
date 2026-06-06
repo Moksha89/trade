@@ -116,6 +116,13 @@ def test_quote_currency_conversion_scales_size():
     assert d.computed_risk_aed == 50.0
 
 
+def test_unverified_currency_blocks_trade():
+    # A 0.0 multiplier means the provider could not verify the quote-currency
+    # conversion; the engine must refuse to size rather than guess.
+    d = evaluate_proposal(_long(), _ctx(account_ccy_per_point=0.0), RISK, STRAT)
+    assert not d.approved and "currency conversion" in d.reason
+
+
 def test_bearish_disabled_blocks_short():
     strat = {**STRAT, "allow_bearish": False}
     short = TradeProposal(

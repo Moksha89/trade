@@ -47,13 +47,14 @@ def _utcnow() -> datetime:
 def _risk_unit_multiplier(provider: MarketDataProvider, instrument: str) -> float:
     """Account-currency value of a 1-point move (size 1) for `instrument`.
 
-    If anything goes wrong (e.g. a transient broker error) we fall back to 1.0
-    so sizing degrades safely rather than raising during a scan.
+    Returns 0.0 if it cannot be determined; the risk engine treats a
+    non-positive multiplier as "cannot size" and rejects, so an order is never
+    placed with an unverified currency conversion.
     """
     try:
         return float(provider.risk_unit_multiplier(instrument))
     except Exception:  # noqa: BLE001
-        return 1.0
+        return 0.0
 
 
 # --------------------------------------------------------------------------
