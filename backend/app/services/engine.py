@@ -342,25 +342,62 @@ def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
     cap = float(risk.get("max_risk_per_trade", 50))
     if actual_risk_aed > cap * SLIPPAGE_ABORT_TOLERANCE and result.deal_id:
         closed = executor.close(result.deal_id, fill)
-        idea.status = "rejected"
         idea.risk_reason = (
             f"aborted: fill slip pushed risk to {actual_risk_aed:.0f} AED "
             f"(> {cap * SLIPPAGE_ABORT_TOLERANCE:.0f} cap+tol)"
         )
+        common = dict(
+            idea_id=idea.id, mode=executor.mode, instrument=idea.instrument,
+            direction=direction, strategy=idea.strategy, entry_price=fill,
+            size=idea.position_size, stop_loss=idea.stop_loss,
+            take_profit_1=idea.take_profit_1, take_profit_2=idea.take_profit_2,
+            initial_risk_aed=round(actual_risk_aed, 2),
+            initial_risk_per_unit=risk_per_unit,
+            management_plan=idea.management_plan,
+            deal_reference=result.deal_reference, deal_id=result.deal_id,
+        )
+        if closed and closed.ok:
+            # Closed cleanly. Book the real round-trip cost (the spread/slippage
+            # paid to open then immediately close) as a closed trade so the
+            # daily-loss governor and loss-streak guard actually see it —
+            # otherwise these aborts bleed the account invisibly past the caps.
+            close_fill = closed.fill_price or fill
+            sign = 1.0 if direction == Direction.LONG.value else -1.0
+            realized = round((close_fill - fill) * sign * idea.position_size * fx, 2)
+            trade = Trade(**common, current_price=close_fill, status="closed",
+                          realized_pl=realized, unrealized_pl=0.0,
+                          closed_at=_utcnow(), close_reason="aborted_slippage")
+            db.add(trade)
+            idea.status = "rejected"
+            log_event(
+                db, "order_aborted_slippage",
+                {"idea_id": idea.id, "deal_id": result.deal_id, "fill": fill,
+                 "close_fill": close_fill, "risk_aed": round(actual_risk_aed, 2),
+                 "realized_pl": realized, "close_ok": True},
+                instrument=idea.instrument,
+            )
+            notify(f"⛔ {idea.instrument} opened then closed: fill slipped, risk "
+                   f"{actual_risk_aed:.0f} AED over the {cap:.0f} cap | cost {realized:+.2f} AED")
+            db.commit()
+            return None
+        # Close FAILED — the oversized position is still live at the broker. Track
+        # it as an open trade so the manage/reconcile loop handles it instead of
+        # leaving an untracked position bleeding off-book. Its server-side stop
+        # still bounds the downside.
+        trade = Trade(**common, current_price=fill, status="open")
+        db.add(trade)
+        idea.status = "executed"
         log_event(
             db, "order_aborted_slippage",
             {"idea_id": idea.id, "deal_id": result.deal_id, "fill": fill,
-             "risk_aed": round(actual_risk_aed, 2), "close_ok": bool(closed and closed.ok)},
+             "risk_aed": round(actual_risk_aed, 2), "close_ok": False},
             instrument=idea.instrument,
         )
-        if closed and not closed.ok:
-            notify(f"⛔ {idea.instrument} slipped (risk {actual_risk_aed:.0f} AED) "
-                   f"and the abort-close FAILED: {closed.error} — CHECK POSITION")
-        else:
-            notify(f"⛔ {idea.instrument} opened then closed: fill slipped, "
-                   f"risk {actual_risk_aed:.0f} AED over the {cap:.0f} cap")
+        notify(f"⛔ {idea.instrument} slipped (risk {actual_risk_aed:.0f} AED) and the "
+               f"abort-close FAILED: {closed.error if closed else 'no result'} — now "
+               f"tracked as OPEN for the manage loop to close")
         db.commit()
-        return None
+        return trade
     trade = Trade(
         idea_id=idea.id,
         mode=executor.mode,

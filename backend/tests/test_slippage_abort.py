@@ -34,8 +34,10 @@ class _Provider:
 class _Exec:
     mode = "live"
 
-    def __init__(self, fill_price):
+    def __init__(self, fill_price, close_fill=None, close_ok=True):
         self._fill = fill_price
+        self._close_fill = close_fill if close_fill is not None else fill_price
+        self._close_ok = close_ok
         self.closed = []
 
     def open(self, **kw):
@@ -46,7 +48,9 @@ class _Exec:
 
     def close(self, deal_id, price):
         self.closed.append((deal_id, price))
-        return ExecutionResult(ok=True, fill_price=price, deal_id=deal_id)
+        if not self._close_ok:
+            return ExecutionResult(ok=False, error="broker rejected close")
+        return ExecutionResult(ok=True, fill_price=self._close_fill, deal_id=deal_id)
 
 
 def _approved_idea(db):
@@ -81,7 +85,9 @@ def test_excessive_slip_aborts_position(monkeypatch):
     try:
         _setup(db)
         idea = _approved_idea(db)
-        ex = _Exec(fill_price=103.0)  # long filled 3 above → risk/unit 4 → ~200 AED >> cap
+        # long filled 3 above (risk/unit 4 → ~200 AED >> cap); closes 1 below
+        # the open fill to model the spread/slippage paid on the round-trip.
+        ex = _Exec(fill_price=103.0, close_fill=102.0)
         monkeypatch.setattr(engine, "get_provider", lambda: _Provider())
         monkeypatch.setattr(engine, "get_executor", lambda: ex)
         out = engine.execute_idea(db, idea)
@@ -91,6 +97,34 @@ def test_excessive_slip_aborts_position(monkeypatch):
         # Position was closed to honor the cap, and no open trade remains.
         assert ex.closed and ex.closed[0][0] == "d1"
         assert db.query(Trade).filter(Trade.status == "open").count() == 0
+        # The round-trip cost is booked as a closed trade so the daily-loss
+        # governor can see it (otherwise aborts bleed off-book).
+        booked = db.query(Trade).filter(Trade.close_reason == "aborted_slippage").one()
+        assert booked.status == "closed"
+        # close fill 102.0 < open fill 103.0 on a long → realized loss.
+        assert booked.realized_pl < 0
+    finally:
+        db.query(Trade).delete()
+        db.query(TradeIdea).delete()
+        db.commit()
+        db.close()
+
+
+def test_abort_close_failure_tracks_open_trade(monkeypatch):
+    # If the abort-close is rejected by the broker, the oversized position is
+    # still live there — it must be tracked as an OPEN trade so the manage/
+    # reconcile loop handles it, not dropped off-book.
+    db = SessionLocal()
+    try:
+        _setup(db)
+        idea = _approved_idea(db)
+        ex = _Exec(fill_price=103.0, close_ok=False)
+        monkeypatch.setattr(engine, "get_provider", lambda: _Provider())
+        monkeypatch.setattr(engine, "get_executor", lambda: ex)
+        out = engine.execute_idea(db, idea)
+        assert out is not None and out.status == "open"
+        assert ex.closed  # an abort-close was attempted
+        assert db.query(Trade).filter(Trade.status == "open").count() == 1
     finally:
         db.query(Trade).delete()
         db.query(TradeIdea).delete()
