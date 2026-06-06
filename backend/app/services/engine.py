@@ -40,6 +40,13 @@ from app.telegram.notifier import notify
 from app.trade_manager.engine import compute_management_actions
 
 
+# A market order can fill away from the price we sized against. We accept a
+# small overshoot (slippage is unavoidable), but if the actual fill pushes
+# per-trade risk above cap × this factor we abort the position instead of
+# letting it ride oversized.
+SLIPPAGE_ABORT_TOLERANCE = 1.3
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -318,21 +325,50 @@ def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
         db.commit()
         return None
 
-    risk_per_unit = abs(exec_entry - idea.stop_loss)
+    # Re-derive risk from the ACTUAL fill (not the pre-fill quote we sized
+    # against). A market order can fill away from the quote; with a fixed stop
+    # that changes the real risk. If the slip pushed risk well past the
+    # per-trade cap, abort the position rather than let it ride oversized.
+    fill = result.fill_price or exec_entry
+    fx = ctx.account_ccy_per_point  # AED per 1-point move, size 1 (>0 here)
+    risk_per_unit = abs(fill - idea.stop_loss)
+    actual_risk_aed = idea.position_size * risk_per_unit * fx
+    cap = float(risk.get("max_risk_per_trade", 50))
+    if actual_risk_aed > cap * SLIPPAGE_ABORT_TOLERANCE and result.deal_id:
+        closed = executor.close(result.deal_id, fill)
+        idea.status = "rejected"
+        idea.risk_reason = (
+            f"aborted: fill slip pushed risk to {actual_risk_aed:.0f} AED "
+            f"(> {cap * SLIPPAGE_ABORT_TOLERANCE:.0f} cap+tol)"
+        )
+        log_event(
+            db, "order_aborted_slippage",
+            {"idea_id": idea.id, "deal_id": result.deal_id, "fill": fill,
+             "risk_aed": round(actual_risk_aed, 2), "close_ok": bool(closed and closed.ok)},
+            instrument=idea.instrument,
+        )
+        if closed and not closed.ok:
+            notify(f"⛔ {idea.instrument} slipped (risk {actual_risk_aed:.0f} AED) "
+                   f"and the abort-close FAILED: {closed.error} — CHECK POSITION")
+        else:
+            notify(f"⛔ {idea.instrument} opened then closed: fill slipped, "
+                   f"risk {actual_risk_aed:.0f} AED over the {cap:.0f} cap")
+        db.commit()
+        return None
     trade = Trade(
         idea_id=idea.id,
         mode=executor.mode,
         instrument=idea.instrument,
         direction=direction,
         strategy=idea.strategy,
-        entry_price=result.fill_price or idea.entry_price,
+        entry_price=fill,
         size=idea.position_size,
         stop_loss=idea.stop_loss,
         take_profit_1=idea.take_profit_1,
         take_profit_2=idea.take_profit_2,
-        initial_risk_aed=idea.risk_aed,
+        initial_risk_aed=round(actual_risk_aed, 2),
         initial_risk_per_unit=risk_per_unit,
-        current_price=result.fill_price or idea.entry_price,
+        current_price=fill,
         management_plan=idea.management_plan,
         deal_reference=result.deal_reference,
         deal_id=result.deal_id,
