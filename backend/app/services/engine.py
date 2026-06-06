@@ -359,19 +359,34 @@ def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
 # --------------------------------------------------------------------------
 # Manage open trades (every 30s–1m)
 # --------------------------------------------------------------------------
+def _ccy_mult(trade: Trade) -> float:
+    """Account-currency value of a 1-point move for this trade.
+
+    Derived from the sizing recorded at open (risk_aed = size * risk_per_unit *
+    mult), so P/L is reported in the account currency (AED) rather than the
+    instrument's quote currency. Falls back to 1.0 when it can't be derived.
+    """
+    denom = trade.size * (trade.initial_risk_per_unit or 0.0)
+    if denom > 0 and trade.initial_risk_aed:
+        return trade.initial_risk_aed / denom
+    return 1.0
+
+
 def _mark_to_market(trade: Trade, price: float) -> None:
     trade.current_price = price
+    mult = _ccy_mult(trade)
     if trade.direction == "long":
-        trade.unrealized_pl = round(trade.size * (price - trade.entry_price), 2)
+        trade.unrealized_pl = round(trade.size * (price - trade.entry_price) * mult, 2)
     else:
-        trade.unrealized_pl = round(trade.size * (trade.entry_price - price), 2)
+        trade.unrealized_pl = round(trade.size * (trade.entry_price - price) * mult, 2)
 
 
 def close_trade(db: Session, trade: Trade, price: float, reason: str) -> None:
+    mult = _ccy_mult(trade)
     if trade.direction == "long":
-        pl = trade.size * (price - trade.entry_price)
+        pl = trade.size * (price - trade.entry_price) * mult
     else:
-        pl = trade.size * (trade.entry_price - price)
+        pl = trade.size * (trade.entry_price - price) * mult
     trade.realized_pl = round(trade.realized_pl + pl, 2)
     trade.unrealized_pl = 0.0
     trade.current_price = price
@@ -391,10 +406,11 @@ def close_trade(db: Session, trade: Trade, price: float, reason: str) -> None:
 
 def _partial_close(db: Session, trade: Trade, price: float, pct: float) -> None:
     closed_size = trade.size * pct / 100.0
+    mult = _ccy_mult(trade)
     if trade.direction == "long":
-        pl = closed_size * (price - trade.entry_price)
+        pl = closed_size * (price - trade.entry_price) * mult
     else:
-        pl = closed_size * (trade.entry_price - price)
+        pl = closed_size * (trade.entry_price - price) * mult
     trade.realized_pl = round(trade.realized_pl + pl, 2)
     trade.size = round(trade.size - closed_size, 6)
     trade.partial_closed = True
