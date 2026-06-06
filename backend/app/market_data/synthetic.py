@@ -80,6 +80,10 @@ class SyntheticProvider:
             spread_points=spread,
         )
 
+    def risk_unit_multiplier(self, instrument: str) -> float:
+        # Synthetic prices are denominated directly in the account currency.
+        return 1.0
+
     def get_snapshot(self, instrument: str) -> MarketSnapshot:
         quote = self.get_quote(instrument)
         rng = random.Random(hash((instrument, "sentiment")) & 0xFFFFFFFF)

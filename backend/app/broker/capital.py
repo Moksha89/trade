@@ -54,6 +54,8 @@ class CapitalClient:
         self._authed_at: float = 0.0
         self._ttl = session_ttl_seconds
         self._client = httpx.Client(base_url=self.base_url, timeout=20.0)
+        self._account_ccy: str | None = None
+        self._meta_cache: dict[str, tuple[str, float]] = {}
 
     # ---- session ---------------------------------------------------------
     @property
@@ -130,6 +132,38 @@ class CapitalClient:
 
     def _epic(self, instrument: str) -> str:
         return EPIC_MAP.get(instrument, instrument)
+
+    def account_currency(self) -> str:
+        if self._account_ccy is None:
+            data = self.get_accounts()
+            accounts = data.get("accounts", [])
+            self._account_ccy = (accounts[0].get("currency") if accounts else "") or ""
+        return self._account_ccy
+
+    def instrument_meta(self, instrument: str) -> tuple[str, float]:
+        """Return (quote_currency, lot_size) for an instrument, cached."""
+        epic = self._epic(instrument)
+        if epic not in self._meta_cache:
+            resp = self._request("GET", f"/api/v1/markets/{epic}")
+            if resp.status_code != 200:
+                raise CapitalError(f"market meta failed: {resp.status_code}")
+            inst = resp.json().get("instrument", {})
+            ccy = (inst.get("currency") or "").upper()
+            lot = float(inst.get("lotSize") or 1.0)
+            self._meta_cache[epic] = (ccy, lot)
+        return self._meta_cache[epic]
+
+    def risk_unit_multiplier(self, instrument: str) -> float:
+        from app.services.fx import quote_to_account
+
+        try:
+            quote_ccy, lot = self.instrument_meta(instrument)
+            fx = quote_to_account(quote_ccy, self.account_currency())
+        except CapitalError:
+            return 1.0
+        if fx is None:
+            return 1.0
+        return fx * lot
 
     def get_candles(self, instrument: str, resolution: str, count: int) -> list[Candle]:
         epic = self._epic(instrument)

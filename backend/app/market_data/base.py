@@ -49,3 +49,7 @@ class MarketDataProvider(Protocol):
 
     def get_snapshot(self, instrument: str) -> MarketSnapshot:
         ...
+
+    def risk_unit_multiplier(self, instrument: str) -> float:
+        """Account-currency value of a 1-point move for a size-1 position."""
+        ...

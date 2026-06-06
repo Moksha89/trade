@@ -21,6 +21,7 @@ from app.classifier.engine import classify_market, is_tradeable
 from app.config import settings
 from app.execution.factory import get_executor
 from app.indicators.engine import compute_indicators
+from app.market_data.base import MarketDataProvider
 from app.market_data.factory import get_provider
 from app.models import Trade, TradeIdea
 from app.risk.engine import RiskContext, evaluate_proposal
@@ -41,6 +42,18 @@ from app.trade_manager.engine import compute_management_actions
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _risk_unit_multiplier(provider: MarketDataProvider, instrument: str) -> float:
+    """Account-currency value of a 1-point move (size 1) for `instrument`.
+
+    If anything goes wrong (e.g. a transient broker error) we fall back to 1.0
+    so sizing degrades safely rather than raising during a scan.
+    """
+    try:
+        return float(provider.risk_unit_multiplier(instrument))
+    except Exception:  # noqa: BLE001
+        return 1.0
 
 
 # --------------------------------------------------------------------------
@@ -141,6 +154,7 @@ def run_scan(db: Session) -> list[TradeIdea]:
             news_risk=False,
             market_open=snap.market_open,
             trading_locked=state.trading_locked,
+            account_ccy_per_point=_risk_unit_multiplier(provider, instrument),
         )
         decision = evaluate_proposal(proposal, ctx, risk, strategy)
 
@@ -234,6 +248,7 @@ def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
     state = get_bot_state(db)
     open_now = accounts.open_trades(db)
     acct_stats = accounts.stats(db)
+    provider = get_provider()
     ctx = RiskContext(
         account_capital=float(risk.get("account_capital", settings.account_start_capital)),
         open_trades=[{"instrument": t.instrument} for t in open_now],
@@ -244,6 +259,7 @@ def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
         realized_pl_week=float(acct_stats["realized_pl_week"]),
         market_open=True,
         trading_locked=state.trading_locked,
+        account_ccy_per_point=_risk_unit_multiplier(provider, idea.instrument),
     )
     recheck = evaluate_proposal(_proposal_from_idea(idea), ctx, risk, strategy)
     if not recheck.approved:

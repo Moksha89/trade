@@ -29,6 +29,11 @@ class RiskContext:
     news_risk: bool = False
     market_open: bool = True
     trading_locked: bool = False
+    # Account-currency value of a 1-point move for a size-1 position. For an
+    # account whose currency matches the instrument quote currency this is 1.0;
+    # for an AED account trading USD-quoted instruments it is the USD→AED rate
+    # times the lot size. Used to size positions in the account currency.
+    account_ccy_per_point: float = 1.0
 
 
 @dataclass
@@ -158,10 +163,15 @@ def evaluate_proposal(
     if remaining_combined <= 0:
         return reject("Combined open risk cap reached")
     risk_budget = min(max_risk_trade, remaining_combined)
-    size = risk_budget / risk_per_unit
+    # Convert the per-unit stop distance (quote currency) into account currency
+    # so the AED risk budget sizes the position correctly.
+    risk_per_unit_acct = risk_per_unit * ctx.account_ccy_per_point
+    if risk_per_unit_acct <= 0:
+        return reject("Zero stop distance")
+    size = risk_budget / risk_per_unit_acct
     if size <= 0:
         return reject("Computed size is zero")
-    computed_risk = size * risk_per_unit
+    computed_risk = size * risk_per_unit_acct
 
     return RiskDecision(
         approved=True,

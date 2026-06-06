@@ -105,6 +105,17 @@ def test_combined_risk_cap_limits_size():
     assert d.computed_risk_aed == 30.0
 
 
+def test_quote_currency_conversion_scales_size():
+    # USD-quoted instrument on an AED account: a 1-point stop is worth 3.6725
+    # AED per unit, so the 50 AED budget buys fewer units but risks exactly the
+    # budget in account currency (not 3.67x more).
+    ctx = _ctx(account_ccy_per_point=3.6725)
+    d = evaluate_proposal(_long(), ctx, RISK, STRAT)
+    assert d.approved
+    assert d.computed_size == round(50.0 / 3.6725, 6)
+    assert d.computed_risk_aed == 50.0
+
+
 def test_bearish_disabled_blocks_short():
     strat = {**STRAT, "allow_bearish": False}
     short = TradeProposal(
