@@ -139,8 +139,13 @@ def move_sl(trade_id: int, stop_loss: float = Body(..., embed=True), db: Session
         raise HTTPException(404, "open trade not found")
     from app.execution.factory import get_executor
 
+    res = get_executor().modify(trade.deal_id, stop_loss, None)
+    if not res.ok:
+        log_event(db, "sltp_move_failed", {"trade_id": trade_id, "intended_sl": stop_loss, "error": res.error, "manual": True})
+        db.commit()
+        raise HTTPException(502, f"broker rejected stop move: {res.error}")
     trade.stop_loss = stop_loss
-    get_executor().modify(trade.deal_id, stop_loss, None)
+    trade.last_sltp_update = engine._utcnow()
     log_event(db, "sltp_moved", {"trade_id": trade_id, "new_sl": stop_loss, "manual": True})
     db.commit()
     return {"trade": trade_to_dict(trade)}
@@ -153,8 +158,13 @@ def move_tp(trade_id: int, take_profit: float = Body(..., embed=True), db: Sessi
         raise HTTPException(404, "open trade not found")
     from app.execution.factory import get_executor
 
+    res = get_executor().modify(trade.deal_id, None, take_profit)
+    if not res.ok:
+        log_event(db, "sltp_move_failed", {"trade_id": trade_id, "intended_tp": take_profit, "error": res.error, "manual": True})
+        db.commit()
+        raise HTTPException(502, f"broker rejected target move: {res.error}")
     trade.take_profit_1 = take_profit
-    get_executor().modify(trade.deal_id, None, take_profit)
+    trade.last_sltp_update = engine._utcnow()
     log_event(db, "sltp_moved", {"trade_id": trade_id, "new_tp": take_profit, "manual": True})
     db.commit()
     return {"trade": trade_to_dict(trade)}

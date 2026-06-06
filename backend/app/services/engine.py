@@ -382,19 +382,26 @@ def _mark_to_market(trade: Trade, price: float) -> None:
 
 
 def close_trade(db: Session, trade: Trade, price: float, reason: str) -> None:
+    # Send the real close first so we can book P/L at the actual fill and alert
+    # if the broker rejects it (e.g. the position was already closed).
+    executor = get_executor()
+    res = executor.close(trade.deal_id, price)
+    fill = res.fill_price if (res and res.ok and res.fill_price) else price
+    if res and not res.ok:
+        log_event(db, "close_failed", {"trade_id": trade.id, "error": res.error},
+                  instrument=trade.instrument)
+        notify(f"⚠️ {trade.instrument} close may have failed: {res.error}")
     mult = _ccy_mult(trade)
     if trade.direction == "long":
-        pl = trade.size * (price - trade.entry_price) * mult
+        pl = trade.size * (fill - trade.entry_price) * mult
     else:
-        pl = trade.size * (trade.entry_price - price) * mult
+        pl = trade.size * (trade.entry_price - fill) * mult
     trade.realized_pl = round(trade.realized_pl + pl, 2)
     trade.unrealized_pl = 0.0
-    trade.current_price = price
+    trade.current_price = fill
     trade.status = "closed"
     trade.closed_at = _utcnow()
     trade.close_reason = reason
-    executor = get_executor()
-    executor.close(trade.deal_id, price)
     log_event(
         db,
         "trade_closed",
@@ -423,9 +430,51 @@ def _partial_close(db: Session, trade: Trade, price: float, pct: float) -> None:
     notify(f"📉 Partial {pct:.0f}% close {trade.instrument} | realized {trade.realized_pl:+.2f}")
 
 
+def _reconcile_closed_on_broker(db: Session, trade: Trade) -> None:
+    """A live position is no longer held at the broker (its server-side stop or
+    take-profit fired, or it was closed manually in the app). Mirror that into
+    our record so the slot frees up and P/L is booked. Uses the last
+    mark-to-market (already in account currency) as the realized figure."""
+    trade.realized_pl = round((trade.realized_pl or 0.0) + (trade.unrealized_pl or 0.0), 2)
+    trade.unrealized_pl = 0.0
+    trade.status = "closed"
+    trade.closed_at = _utcnow()
+    trade.close_reason = "closed_on_broker"
+    log_event(
+        db, "trade_reconciled",
+        {"trade_id": trade.id, "deal_id": trade.deal_id, "realized_pl": trade.realized_pl},
+        instrument=trade.instrument,
+    )
+    notify(f"ℹ️ {trade.instrument} closed on broker (stop/target/manual) | P/L {trade.realized_pl:+.2f} AED")
+
+
 def manage_open_trades(db: Session) -> None:
     provider = get_provider()
+    executor = get_executor()
+    live = executor.mode in ("demo", "live")
+
+    # In live/demo, learn which positions the broker still holds so we can
+    # detect server-side closes (stop/target) and never act on a phantom trade.
+    broker_deals: dict | None = None
+    if live and hasattr(executor, "client"):
+        try:
+            broker_deals = {}
+            for p in executor.client.get_positions():
+                did = (p.get("position") or {}).get("dealId")
+                if did:
+                    broker_deals[did] = p
+        except Exception as exc:  # noqa: BLE001
+            log_event(db, "reconcile_error", {"error": str(exc)})
+            broker_deals = None  # unknown this tick → leave everything untouched
+
     for trade in accounts.open_trades(db):
+        # Reconcile first: if the broker no longer holds this deal, it closed
+        # server-side or manually — mirror it and free the slot.
+        if live and broker_deals is not None and trade.deal_id and trade.deal_id not in broker_deals:
+            _reconcile_closed_on_broker(db, trade)
+            db.commit()
+            continue
+
         try:
             quote = provider.get_quote(trade.instrument)
         except Exception as exc:  # noqa: BLE001
@@ -437,17 +486,19 @@ def manage_open_trades(db: Session) -> None:
         price = quote.bid if trade.direction == "long" else quote.ask
         _mark_to_market(trade, price)
 
-        # Hard stop / target hits (paper simulation; live uses server-side stops).
-        if trade.direction == "long":
-            if price <= trade.stop_loss:
-                close_trade(db, trade, trade.stop_loss, "stop_loss"); db.commit(); continue
-            if trade.take_profit_2 and price >= trade.take_profit_2:
-                close_trade(db, trade, trade.take_profit_2, "take_profit_2"); db.commit(); continue
-        else:
-            if price >= trade.stop_loss:
-                close_trade(db, trade, trade.stop_loss, "stop_loss"); db.commit(); continue
-            if trade.take_profit_2 and price <= trade.take_profit_2:
-                close_trade(db, trade, trade.take_profit_2, "take_profit_2"); db.commit(); continue
+        # Synthetic stop/target close is paper-only; live positions are closed by
+        # the broker's own server-side stop/TP and mirrored via reconciliation.
+        if not live:
+            if trade.direction == "long":
+                if price <= trade.stop_loss:
+                    close_trade(db, trade, trade.stop_loss, "stop_loss"); db.commit(); continue
+                if trade.take_profit_2 and price >= trade.take_profit_2:
+                    close_trade(db, trade, trade.take_profit_2, "take_profit_2"); db.commit(); continue
+            else:
+                if price >= trade.stop_loss:
+                    close_trade(db, trade, trade.stop_loss, "stop_loss"); db.commit(); continue
+                if trade.take_profit_2 and price <= trade.take_profit_2:
+                    close_trade(db, trade, trade.take_profit_2, "take_profit_2"); db.commit(); continue
 
         plan = trade.management_plan or {}
         trail_level = None
@@ -486,23 +537,37 @@ def manage_open_trades(db: Session) -> None:
 
         if actions.new_stop_loss is not None:
             old = trade.stop_loss
-            trade.stop_loss = actions.new_stop_loss
-            trade.last_sltp_update = _utcnow()
-            if any("breakeven" in r for r in actions.reasons):
-                trade.breakeven_moved = True
-            if any("lock" in r for r in actions.reasons):
-                trade.profit_locked = True
-                trade.breakeven_moved = True
-            get_executor().modify(trade.deal_id, trade.stop_loss, None)
-            log_event(
-                db, "sltp_moved",
-                {"trade_id": trade.id, "old_sl": old, "new_sl": trade.stop_loss,
-                 "reasons": actions.reasons},
-                instrument=trade.instrument,
-            )
-            notify(f"🔧 {trade.instrument} SL → {trade.stop_loss} ({','.join(actions.reasons)})")
+            # Push to the broker FIRST; only record the move if it actually
+            # took, so our stored stop can never drift from the broker's. Spec:
+            # alert immediately if a stop/target modification fails.
+            res = executor.modify(trade.deal_id, actions.new_stop_loss, None)
+            if res.ok:
+                trade.stop_loss = actions.new_stop_loss
+                trade.last_sltp_update = _utcnow()
+                if any("breakeven" in r for r in actions.reasons):
+                    trade.breakeven_moved = True
+                if any("lock" in r for r in actions.reasons):
+                    trade.profit_locked = True
+                    trade.breakeven_moved = True
+                log_event(
+                    db, "sltp_moved",
+                    {"trade_id": trade.id, "old_sl": old, "new_sl": trade.stop_loss,
+                     "reasons": actions.reasons},
+                    instrument=trade.instrument,
+                )
+                notify(f"🔧 {trade.instrument} SL → {trade.stop_loss} ({','.join(actions.reasons)})")
+            else:
+                log_event(
+                    db, "sltp_move_failed",
+                    {"trade_id": trade.id, "intended_sl": actions.new_stop_loss, "error": res.error},
+                    instrument=trade.instrument,
+                )
+                notify(f"⚠️ {trade.instrument} SL move FAILED ({res.error}); broker stop stays at {old}")
 
-        if (actions.partial_close_percent or tp1_hit) and not trade.partial_closed:
+        # Partial close is paper-only. In live the server-side take-profit closes
+        # the full position at TP1, so a DB-only partial would desync from the
+        # broker; we deliberately skip it.
+        if not live and (actions.partial_close_percent or tp1_hit) and not trade.partial_closed:
             pct = actions.partial_close_percent or float(plan.get("partial_close_percent", 50))
             _partial_close(db, trade, price, pct)
 
