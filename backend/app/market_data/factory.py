@@ -23,9 +23,9 @@ def get_provider(mode: str | None = None) -> MarketDataProvider:
     if mode == "paper":
         return _synthetic()
     # demo/approval/live need a real broker; fall back to synthetic if unconfigured.
-    from app.broker.capital import CapitalClient
+    from app.broker.capital import get_capital_client
 
-    client = CapitalClient()
+    client = get_capital_client()
     if client.configured:
         return client
     return _synthetic()

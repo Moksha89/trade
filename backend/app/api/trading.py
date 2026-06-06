@@ -240,9 +240,9 @@ def emergency_action(action: str, db: Session = Depends(get_db)) -> dict:
 # ---- broker connection ---------------------------------------------------
 @router.get("/broker/status")
 def broker_status(db: Session = Depends(get_db)) -> dict:
-    from app.broker.capital import CapitalClient
+    from app.broker.capital import get_capital_client
 
-    client = CapitalClient()
+    client = get_capital_client()
     state = get_bot_state(db)
     broker_rt = get_group(db, BROKER_RUNTIME)
     info: dict[str, Any] = {
@@ -261,9 +261,9 @@ def broker_status(db: Session = Depends(get_db)) -> dict:
 
 @router.post("/broker/reconnect")
 def broker_reconnect(db: Session = Depends(get_db)) -> dict:
-    from app.broker.capital import CapitalClient, CapitalError
+    from app.broker.capital import CapitalError, get_capital_client
 
-    client = CapitalClient()
+    client = get_capital_client()
     if not client.configured:
         raise HTTPException(400, "Capital.com credentials not configured (need identifier)")
     try:

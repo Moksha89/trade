@@ -585,9 +585,9 @@ def run_health(db: Session) -> None:
     # dashboard can show a live connection without ever placing an order
     # (order routing is gated separately by EXECUTION_MODE in the executor).
     connected = False
-    from app.broker.capital import CapitalClient
+    from app.broker.capital import get_capital_client
 
-    client = CapitalClient()
+    client = get_capital_client()
     if client.configured:
         try:
             client.ensure_session()

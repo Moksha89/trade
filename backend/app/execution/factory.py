@@ -11,10 +11,10 @@ def get_executor(mode: str | None = None) -> Executor:
     mode = (mode or settings.execution_mode).lower()
     if mode == "paper":
         return PaperExecutor()
-    from app.broker.capital import CapitalClient
+    from app.broker.capital import get_capital_client
     from app.execution.broker import BrokerExecutor
 
-    client = CapitalClient()
+    client = get_capital_client()
     if not client.configured:
         # No broker credentials yet → safe paper simulation.
         return PaperExecutor()

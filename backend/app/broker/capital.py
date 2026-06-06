@@ -13,6 +13,7 @@ headers that authenticate subsequent calls.
 from __future__ import annotations
 
 import time
+from functools import lru_cache
 from typing import Any
 
 import httpx
@@ -308,3 +309,16 @@ class CapitalClient:
 
     def close(self) -> None:
         self._client.close()
+
+
+@lru_cache(maxsize=1)
+def get_capital_client() -> "CapitalClient":
+    """Process-wide shared client.
+
+    A new ``CapitalClient`` starts with no session, so creating one per call
+    (as the factories used to) forced a fresh ``login()`` on every scan/manage
+    tick and tripped Capital.com's session-creation rate limit (429). Sharing a
+    single instance lets the 9-minute session cache do its job: one login per
+    TTL instead of several per tick.
+    """
+    return CapitalClient()
