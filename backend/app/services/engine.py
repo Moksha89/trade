@@ -527,6 +527,79 @@ def _reconcile_closed_on_broker(db: Session, trade: Trade) -> None:
     notify(f"ℹ️ {trade.instrument} closed on broker (stop/target/manual) | P/L {trade.realized_pl:+.2f} AED")
 
 
+def _instrument_from_epic(epic: str) -> str:
+    """Map a broker epic to our instrument name.
+
+    The live system keys instruments by their epic (e.g. BTCUSD, GOLD, US100 —
+    see the allowed-instruments list), so the epic IS the instrument name.
+    Returning it keeps adopted trades named consistently with bot trades."""
+    return epic or ""
+
+
+def _adopt_untracked_positions(
+    db: Session, provider: MarketDataProvider, executor, broker_deals: dict
+) -> None:
+    """Pull any live broker position we don't already track into the DB.
+
+    This makes manually-placed trades (opened in the Capital.com app) visible on
+    the dashboard, counted toward the risk caps, and managed by the bot exactly
+    like a bot-opened trade. Without this, manual positions are off-book: hidden
+    from the panel and invisible to the combined-risk / max-active governors.
+    """
+    known = {t.deal_id for t in accounts.open_trades(db) if t.deal_id}
+    for did, row in broker_deals.items():
+        if did in known:
+            continue
+        pos = row.get("position") or {}
+        mkt = row.get("market") or {}
+        instrument = _instrument_from_epic(mkt.get("epic") or "")
+        entry = float(pos.get("level") or 0.0)
+        size = float(pos.get("size") or 0.0)
+        if entry <= 0 or size <= 0:
+            continue
+        direction = "long" if str(pos.get("direction", "")).upper() == "BUY" else "short"
+        stop = pos.get("stopLevel")
+        # Capital's position node carries the take-profit under "profitLevel"
+        # (NOT "limitLevel", which is for working orders).
+        tp = pos.get("profitLevel")
+        rpu = abs(entry - float(stop)) if stop else 0.0
+        mult = _risk_unit_multiplier(provider, instrument)
+        risk_aed = round(size * rpu * mult, 2) if (rpu > 0 and mult > 0) else 0.0
+        trade = Trade(
+            idea_id=None,
+            mode=executor.mode,
+            instrument=instrument,
+            direction=direction,
+            strategy="manual",
+            entry_price=entry,
+            size=size,
+            stop_loss=float(stop) if stop else entry,
+            take_profit_1=float(tp) if tp else 0.0,
+            take_profit_2=0.0,
+            initial_risk_aed=risk_aed,
+            initial_risk_per_unit=rpu,
+            current_price=entry,
+            status="open",
+            management_plan=ManagementPlan().model_dump(),
+            deal_id=str(did),
+            deal_reference=pos.get("dealReference"),
+        )
+        db.add(trade)
+        db.flush()
+        log_event(
+            db, "trade_adopted",
+            {"trade_id": trade.id, "deal_id": str(did), "instrument": instrument,
+             "direction": direction, "size": size, "entry": entry,
+             "stop": stop, "tp": tp, "risk_aed": risk_aed, "has_stop": stop is not None},
+            instrument=instrument,
+        )
+        notify(
+            f"📥 Adopted untracked {instrument} {direction.upper()} size {size:.4f} "
+            f"@ {entry} (SL {stop}, TP {tp}) — now tracked & managed"
+        )
+    db.commit()
+
+
 def manage_open_trades(db: Session) -> None:
     provider = get_provider()
     executor = get_executor()
@@ -545,6 +618,11 @@ def manage_open_trades(db: Session) -> None:
         except Exception as exc:  # noqa: BLE001
             log_event(db, "reconcile_error", {"error": str(exc)})
             broker_deals = None  # unknown this tick → leave everything untouched
+
+    # Adopt any broker position we don't track yet (e.g. trades placed manually
+    # in the Capital.com app) so every position in the account is on-book.
+    if live and broker_deals:
+        _adopt_untracked_positions(db, provider, executor, broker_deals)
 
     for trade in accounts.open_trades(db):
         # Reconcile first: if the broker no longer holds this deal, it closed

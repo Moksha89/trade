@@ -28,6 +28,13 @@ def closed_trades(db: Session) -> list[Trade]:
 
 
 def current_open_risk(db: Session) -> float:
+    """Combined open risk in account currency (AED).
+
+    Converts each position's quote-currency stop distance into AED via the
+    per-trade multiplier recorded at open (initial_risk_aed / (size *
+    initial_risk_per_unit)) so the figure is comparable to the AED combined-risk
+    cap. USD-quoted instruments would otherwise be under-counted by the FX rate.
+    """
     total = 0.0
     for t in open_trades(db):
         adverse = abs(t.entry_price - t.stop_loss)
@@ -36,7 +43,9 @@ def current_open_risk(db: Session) -> float:
             adverse = 0.0
         if t.direction == "short" and t.stop_loss <= t.entry_price:
             adverse = 0.0
-        total += t.size * adverse
+        denom = t.size * (t.initial_risk_per_unit or 0.0)
+        mult = (t.initial_risk_aed / denom) if (denom > 0 and t.initial_risk_aed) else 1.0
+        total += t.size * adverse * mult
     return round(total, 2)
 
 
