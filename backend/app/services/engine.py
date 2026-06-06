@@ -431,7 +431,10 @@ def manage_open_trades(db: Session) -> None:
         except Exception as exc:  # noqa: BLE001
             log_event(db, "market_data_error", {"error": str(exc)}, instrument=trade.instrument)
             continue
-        price = quote.mid
+        # Mark to the price the position would actually close at (cross the
+        # spread): bid for longs, ask for shorts. This matches the broker's
+        # unrealized P/L instead of the optimistic mid.
+        price = quote.bid if trade.direction == "long" else quote.ask
         _mark_to_market(trade, price)
 
         # Hard stop / target hits (paper simulation; live uses server-side stops).
