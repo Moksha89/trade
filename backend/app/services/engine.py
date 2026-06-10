@@ -851,6 +851,114 @@ def _grade_setup(
     return {"verdict": "caution", "summary": f"Caution — {joined}.", "reasons": reasons}
 
 
+def _enforce_stop_risk_cap(
+    db: Session, provider: MarketDataProvider, executor, trade: Trade, risk: dict[str, Any],
+) -> None:
+    """Hard-cap a trade's risk at max_risk_per_trade by tightening an over-risk
+    stop to the cap distance. Only acts on a stop sitting on the LOSING side
+    (long stop below entry / short stop above entry); a stop already trailed
+    into profit is left to the trailing manager. Safe to call every cycle."""
+    if not bool(risk.get("enforce_risk_cap", True)):
+        return
+    entry = trade.entry_price
+    is_long = trade.direction == "long"
+    has_sl = bool(trade.stop_loss) and trade.stop_loss > 0 and abs(trade.stop_loss - entry) > 1e-9
+    on_risk_side = (is_long and trade.stop_loss < entry) or (
+        (not is_long) and trade.stop_loss > entry
+    )
+    if not (has_sl and on_risk_side) or trade.size <= 0:
+        return
+    mult = _risk_unit_multiplier(provider, trade.instrument)
+    if mult <= 0:
+        return
+    cap = float(risk.get("max_risk_per_trade", 50))
+    cur_risk = trade.size * abs(entry - trade.stop_loss) * mult
+    cap_dist = cap / (trade.size * mult)
+    if cur_risk <= cap + 0.5 or cap_dist <= 0:
+        return
+    try:
+        q = provider.get_quote(trade.instrument)
+        cur = q.bid if is_long else q.ask
+    except Exception:  # noqa: BLE001
+        cur = entry
+    atr = 0.0
+    try:
+        atr = float(compute_indicators(provider.get_candles(trade.instrument, "5M", 60)).atr or 0.0)
+    except Exception:  # noqa: BLE001
+        atr = 0.0
+    buf = max(atr * 0.5, abs(cur) * 0.0008)
+    if is_long:
+        capped_sl = round(min(entry - cap_dist, cur - buf), 5)
+    else:
+        capped_sl = round(max(entry + cap_dist, cur + buf), 5)
+    tighter = (capped_sl > trade.stop_loss) if is_long else (capped_sl < trade.stop_loss)
+    if not tighter:
+        return
+    res = executor.modify(trade.deal_id, capped_sl, None)
+    if not res.ok:
+        log_event(
+            db, "risk_cap_failed",
+            {"trade_id": trade.id, "intended_sl": capped_sl, "error": res.error},
+            instrument=trade.instrument,
+        )
+        return
+    old_sl, old_risk = trade.stop_loss, round(cur_risk, 2)
+    trade.stop_loss = capped_sl
+    trade.initial_risk_per_unit = abs(entry - capped_sl)
+    trade.initial_risk_aed = round(trade.size * abs(entry - capped_sl) * mult, 2)
+    trade.last_sltp_update = _utcnow()
+    log_event(
+        db, "risk_capped",
+        {"trade_id": trade.id, "strategy": trade.strategy, "old_sl": old_sl,
+         "new_sl": capped_sl, "old_risk_aed": old_risk, "cap": cap,
+         "new_risk_aed": trade.initial_risk_aed},
+        instrument=trade.instrument,
+    )
+    notify(
+        f"🧷 {trade.instrument} {trade.direction.upper()}: stop risked {old_risk} AED "
+        f"(over {cap} cap) — tightened to risk ≤ {trade.initial_risk_aed} AED"
+    )
+
+
+def _apply_bot_trailing_and_cap(
+    db: Session, provider: MarketDataProvider, executor, trade: Trade, risk: dict[str, Any],
+) -> None:
+    """Make a bot trade behave like a manual one for exits: trailing stop with no
+    fixed take-profit ceiling, plus the hard risk cap. Clearing the broker TP
+    once lets the position ride the move; the main manage loop then trails the
+    stop. Gated by bot_trailing_tp (default on)."""
+    plan = dict(trade.management_plan or {})
+    if bool(risk.get("bot_trailing_tp", True)):
+        plan["trail_start_R"] = float(risk.get("bot_trail_start_R", 1.0))
+        # Remove any fixed broker target once so the trailing stop is the exit.
+        if not plan.get("bot_tp_cleared"):
+            has_tp = (trade.take_profit_1 or 0) > 0 or (trade.take_profit_2 or 0) > 0
+            if has_tp:
+                res = executor.clear_take_profit(trade.deal_id)
+                if res.ok:
+                    old_tp = trade.take_profit_1 or trade.take_profit_2
+                    trade.take_profit_1 = 0.0
+                    trade.take_profit_2 = 0.0
+                    plan["bot_tp_cleared"] = True
+                    log_event(
+                        db, "bot_tp_cleared",
+                        {"trade_id": trade.id, "old_tp": old_tp}, instrument=trade.instrument,
+                    )
+                    notify(
+                        f"🎯 {trade.instrument} {trade.direction.upper()}: removed fixed TP "
+                        f"— now trailing so profit can ride the move"
+                    )
+                else:
+                    log_event(
+                        db, "bot_tp_clear_failed",
+                        {"trade_id": trade.id, "error": res.error}, instrument=trade.instrument,
+                    )
+            else:
+                plan["bot_tp_cleared"] = True
+        trade.management_plan = plan
+    _enforce_stop_risk_cap(db, provider, executor, trade, risk)
+
+
 def _protect_and_grade_manual(
     db: Session, provider: MarketDataProvider, executor, trade: Trade,
     risk: dict[str, Any], live: bool,
@@ -993,63 +1101,9 @@ def _protect_and_grade_manual(
                 )
 
     # 1a. Enforce the per-trade risk cap on the stop — even a stop the user set
-    #     by hand. If the current stop sits on the losing side and risks more
-    #     than the cap, tighten it to the cap distance. A stop already trailed
-    #     into profit is left alone (the trailing manager owns it). Re-checked
-    #     each cycle until satisfied so it also fixes already-adopted trades.
-    if live and bool(risk.get("manual_enforce_risk_cap", True)):
-        cap = float(risk.get("max_risk_per_trade", 50))
-        mult = _risk_unit_multiplier(provider, trade.instrument)
-        has_sl = bool(trade.stop_loss) and trade.stop_loss > 0 and abs(trade.stop_loss - entry) > 1e-9
-        # risk side only: long stop below entry, short stop above entry
-        on_risk_side = (is_long and trade.stop_loss < entry) or (
-            (not is_long) and trade.stop_loss > entry
-        )
-        if has_sl and on_risk_side and mult > 0 and trade.size > 0:
-            cur_risk = trade.size * abs(entry - trade.stop_loss) * mult
-            cap_dist = cap / (trade.size * mult)
-            if cur_risk > cap + 0.5 and cap_dist > 0:
-                atr = float(ind.atr or 0.0)
-                try:
-                    q = provider.get_quote(trade.instrument)
-                    cur = q.bid if is_long else q.ask
-                except Exception:  # noqa: BLE001
-                    cur = entry
-                buf = max(atr * 0.5, abs(cur) * 0.0008)
-                if is_long:
-                    capped_sl = round(min(entry - cap_dist, cur - buf), 5)
-                else:
-                    capped_sl = round(max(entry + cap_dist, cur + buf), 5)
-                # Only act if it genuinely tightens (moves the stop toward entry).
-                tighter = (capped_sl > trade.stop_loss) if is_long else (capped_sl < trade.stop_loss)
-                if tighter:
-                    res = executor.modify(trade.deal_id, capped_sl, None)
-                    if res.ok:
-                        old_sl, old_risk = trade.stop_loss, round(cur_risk, 2)
-                        trade.stop_loss = capped_sl
-                        trade.initial_risk_per_unit = abs(entry - capped_sl)
-                        trade.initial_risk_aed = round(
-                            trade.size * abs(entry - capped_sl) * mult, 2
-                        )
-                        trade.last_sltp_update = _utcnow()
-                        log_event(
-                            db, "manual_risk_capped",
-                            {"trade_id": trade.id, "old_sl": old_sl, "new_sl": capped_sl,
-                             "old_risk_aed": old_risk, "cap": cap,
-                             "new_risk_aed": trade.initial_risk_aed},
-                            instrument=trade.instrument,
-                        )
-                        notify(
-                            f"🧷 {trade.instrument} {trade.direction.upper()}: stop risked "
-                            f"{old_risk} AED (over {cap} cap) — tightened to risk "
-                            f"≤ {trade.initial_risk_aed} AED"
-                        )
-                    else:
-                        log_event(
-                            db, "manual_risk_cap_failed",
-                            {"trade_id": trade.id, "intended_sl": capped_sl, "error": res.error},
-                            instrument=trade.instrument,
-                        )
+    #     by hand. Shared with bot trades; safe to call every cycle.
+    if live:
+        _enforce_stop_risk_cap(db, provider, executor, trade, risk)
 
     # 1b. Trailing exit: if a manual trade still carries a fixed broker TP (set
     #     before trailing was enabled, or attached manually), remove it once so
@@ -1140,6 +1194,10 @@ def manage_open_trades(db: Session) -> None:
         # plan and grade isn't meaningful for them).
         if trade.strategy == "manual" and manage_risk.get("manage_manual_trades", True):
             _protect_and_grade_manual(db, provider, executor, trade, manage_risk, live)
+        # Bot trades: same trailing exit (no fixed TP) + hard risk cap, so every
+        # position rides the move with a capped downside. Toggle bot_trailing_tp.
+        elif live and trade.strategy != "manual":
+            _apply_bot_trailing_and_cap(db, provider, executor, trade, manage_risk)
 
         try:
             quote = provider.get_quote(trade.instrument)

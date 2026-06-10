@@ -262,6 +262,58 @@ def test_enforce_risk_cap_leaves_profit_locked_stop(monkeypatch):
     _clear(db)
 
 
+def test_bot_trade_trailing_clears_tp_and_arms_trail(monkeypatch):
+    db = SessionLocal()
+    _clear(db)
+    # A bot trade is born with a fixed broker TP. With bot_trailing_tp on, the
+    # TP is cleared once and the ATR trail armed so the winner can ride.
+    t = Trade(
+        idea_id=None, mode="live", instrument="US100", direction="short",
+        strategy="momentum_continuation", entry_price=100.0, size=0.05,
+        stop_loss=101.0, take_profit_1=96.0, take_profit_2=94.0,
+        current_price=100.0, status="open", management_plan={}, deal_id="DB",
+    )
+    db.add(t)
+    db.commit()
+    calls: list = []
+    cleared: list = []
+
+    engine._apply_bot_trailing_and_cap(db, _Prov(100.0, 100.0), _exec(calls, cleared), t, default_risk())
+    db.commit()
+    db.refresh(t)
+
+    assert cleared == ["DB"]
+    assert (t.take_profit_1 or 0) == 0 and (t.take_profit_2 or 0) == 0
+    assert t.management_plan["bot_tp_cleared"] is True
+    assert t.management_plan["trail_start_R"] == 1.0
+    _clear(db)
+
+
+def test_bot_trade_risk_cap_tightens_wide_stop(monkeypatch):
+    db = SessionLocal()
+    _clear(db)
+    # The hard risk cap applies to bot trades too: a stop risking >50 AED is
+    # tightened to the cap distance.
+    t = Trade(
+        idea_id=None, mode="live", instrument="US100", direction="short",
+        strategy="momentum_continuation", entry_price=100.0, size=1.0,
+        stop_loss=130.0, take_profit_1=0.0, current_price=100.0, status="open",
+        management_plan={"bot_tp_cleared": True}, deal_id="DBC",
+    )
+    db.add(t)
+    db.commit()
+    _patch_analysis(monkeypatch, 2.0, _sig(False, True, False, True), {"1H": "down", "4H": "down"})
+    calls: list = []
+
+    engine._apply_bot_trailing_and_cap(db, _Prov(100.0, 100.0), _exec(calls), t, default_risk())
+    db.commit()
+    db.refresh(t)
+
+    assert 100.0 < t.stop_loss < 130.0
+    assert t.initial_risk_aed <= 50.5
+    _clear(db)
+
+
 def test_protect_clamps_tp_to_valid_side_of_price(monkeypatch):
     db = SessionLocal()
     _clear(db)

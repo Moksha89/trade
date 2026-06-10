@@ -33,6 +33,11 @@ class _Exec:
 
         return ExecutionResult(ok=True)
 
+    def clear_take_profit(self, *a, **k):  # pragma: no cover
+        from app.execution.base import ExecutionResult
+
+        return ExecutionResult(ok=True)
+
 
 def _make_trade(db, deal_id):
     t = Trade(

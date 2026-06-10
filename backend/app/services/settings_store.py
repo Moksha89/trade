@@ -69,9 +69,14 @@ def default_risk() -> dict[str, Any]:
         # in (breakeven/lock already protect before that).
         "manual_trailing_tp": True,
         "manual_trail_start_R": 1.0,
-        # Hard-cap manual-trade risk at max_risk_per_trade even on a stop the
-        # user placed by hand: tighten an over-risk stop to the cap distance.
-        "manual_enforce_risk_cap": True,
+        # Trailing exit for the bot's OWN trades too: clear the fixed broker TP
+        # so the position rides the move and exits on the trailing stop.
+        "bot_trailing_tp": True,
+        "bot_trail_start_R": 1.0,
+        # Hard-cap per-trade risk at max_risk_per_trade for every trade (manual
+        # or bot) even on a stop placed by hand: tighten an over-risk stop to the
+        # cap distance. A stop already trailed into profit is left untouched.
+        "enforce_risk_cap": True,
         "hedging_enabled": env.hedging_enabled,
         "news_filter_enabled": True,
         "market_hours_filter_enabled": True,
