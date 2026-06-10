@@ -44,6 +44,8 @@ def default_risk() -> dict[str, Any]:
         "max_spread_points": 5.0,
         "min_stop_to_spread_ratio": 3.0,
         "max_sl_distance_pct": 2.0,
+        "trend_alignment_enabled": True,
+        "trend_alignment_timeframes": ["1H", "4H"],
         "hedging_enabled": env.hedging_enabled,
         "news_filter_enabled": True,
         "market_hours_filter_enabled": True,

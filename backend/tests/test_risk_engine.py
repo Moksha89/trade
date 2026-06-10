@@ -189,3 +189,39 @@ def test_zero_spread_skips_ratio_gate():
     # No live spread (0.0) must not block — gate only applies when known.
     d = evaluate_proposal(_long(), _ctx(spread_points=0.0), RISK, STRAT)
     assert d.approved
+
+
+# --- Higher-timeframe trend alignment (4b) ---
+
+def test_long_blocked_when_higher_tf_down():
+    # Long while 4H trend is down -> counter-trend, rejected.
+    d = evaluate_proposal(_long(), _ctx(htf_trends={"1H": "up", "4H": "down"}), RISK, STRAT)
+    assert not d.approved and "Counter-trend" in d.reason and "4H" in d.reason
+
+
+def test_short_blocked_when_higher_tf_up():
+    d = evaluate_proposal(_short(), _ctx(htf_trends={"1H": "up", "4H": "up"}), RISK, STRAT)
+    assert not d.approved and "Counter-trend" in d.reason
+
+
+def test_long_allowed_when_higher_tf_aligned_or_sideways():
+    # 1H up (agrees), 4H sideways (neutral) -> allowed.
+    d = evaluate_proposal(_long(), _ctx(htf_trends={"1H": "up", "4H": "sideways"}), RISK, STRAT)
+    assert d.approved
+
+
+def test_short_allowed_when_higher_tf_down_or_sideways():
+    d = evaluate_proposal(_short(), _ctx(htf_trends={"1H": "down", "4H": "sideways"}), RISK, STRAT)
+    assert d.approved
+
+
+def test_trend_alignment_disabled_allows_counter_trend():
+    risk = {**RISK, "trend_alignment_enabled": False}
+    d = evaluate_proposal(_long(), _ctx(htf_trends={"1H": "down", "4H": "down"}), risk, STRAT)
+    assert d.approved
+
+
+def test_no_htf_data_does_not_block():
+    # Empty htf_trends (data hiccup) must not fabricate a block.
+    d = evaluate_proposal(_long(), _ctx(htf_trends={}), RISK, STRAT)
+    assert d.approved

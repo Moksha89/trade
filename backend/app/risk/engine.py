@@ -34,6 +34,10 @@ class RiskContext:
     # for an AED account trading USD-quoted instruments it is the USD→AED rate
     # times the lot size. Used to size positions in the account currency.
     account_ccy_per_point: float = 1.0
+    # Higher-timeframe trend per timeframe label, e.g. {"1H": "down", "4H": "up"}.
+    # Each value is one of "up" | "down" | "sideways". Used to block trades that
+    # fight the higher-timeframe trend. Empty disables the check.
+    htf_trends: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -95,6 +99,21 @@ def evaluate_proposal(
         return reject(
             f"Confidence {proposal.confidence:.0f} below threshold {min_conf:.0f}"
         )
+
+    # 4b. Higher-timeframe trend alignment. Reject trades that fight the higher
+    # timeframe trend — no longs while a higher timeframe is trending down, no
+    # shorts while it is trending up. A "sideways"/neutral timeframe never
+    # blocks; only a directly opposing trend does. This stops the counter-trend,
+    # low-conviction entries (e.g. buying into a 4H downtrend) that repeatedly
+    # got stopped out.
+    if risk.get("trend_alignment_enabled", True) and ctx.htf_trends:
+        opposing = "down" if proposal.direction == Direction.LONG else "up"
+        against = [tf for tf, tr in ctx.htf_trends.items() if tr == opposing]
+        if against:
+            return reject(
+                f"Counter-trend: {proposal.direction.value} vs "
+                f"{'/'.join(sorted(against))} {opposing}trend"
+            )
 
     # 5. Valid SL/TP geometry (no trade without SL + TP).
     entry = proposal.entry_price

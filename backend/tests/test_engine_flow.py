@@ -17,18 +17,25 @@ def _auth() -> dict[str, str]:
 
 
 def test_scan_proposes_and_risk_decides():
+    # The /api/bot/scan endpoint runs the scan in a background thread and returns
+    # immediately, so call the engine directly to assert on the created ideas.
+    from app.db import SessionLocal
+    from app.services import engine
+
     h = _auth()
     client.post("/api/bot/start", headers=h)
-    r = client.post("/api/bot/scan", headers=h)
-    assert r.status_code == 200
-    ideas = r.json()["created"]
-    # At least one instrument should yield an idea; every idea carries a decision.
-    for idea in ideas:
-        assert idea["risk_reason"]
-        assert idea["status"] in ("approved", "rejected")
-        if idea["risk_approved"]:
-            assert idea["stop_loss"] > 0 and idea["take_profit_1"] > 0
-            assert idea["position_size"] > 0
+    db = SessionLocal()
+    try:
+        ideas = engine.run_scan(db)
+        # At least one instrument should yield an idea; every idea carries a decision.
+        for idea in ideas:
+            assert idea.risk_reason
+            assert idea.status in ("approved", "rejected")
+            if idea.risk_approved:
+                assert idea.stop_loss > 0 and idea.take_profit_1 > 0
+                assert idea.position_size > 0
+    finally:
+        db.close()
 
 
 def test_approve_executes_and_enforces_max_active():

@@ -64,6 +64,25 @@ def _risk_unit_multiplier(provider: MarketDataProvider, instrument: str) -> floa
         return 0.0
 
 
+def _higher_timeframe_trends(
+    provider: MarketDataProvider, instrument: str, timeframes: list[str]
+) -> dict[str, str]:
+    """Trend ("up"|"down"|"sideways") on each higher timeframe for `instrument`.
+
+    Timeframes that fail to load are simply omitted so a data hiccup never
+    fabricates an alignment signal — the risk engine only blocks on an explicit
+    opposing trend.
+    """
+    trends: dict[str, str] = {}
+    for tf in timeframes:
+        try:
+            candles = provider.get_candles(instrument, tf, 200)
+            trends[tf] = compute_indicators(candles).trend
+        except Exception:  # noqa: BLE001
+            continue
+    return trends
+
+
 # --------------------------------------------------------------------------
 # Scan & propose (every 5 minutes)
 # --------------------------------------------------------------------------
@@ -150,6 +169,14 @@ def run_scan(db: Session) -> list[TradeIdea]:
             instrument=instrument,
         )
 
+        htf_trends: dict[str, str] = {}
+        if proposal.is_trade and risk.get("trend_alignment_enabled", True):
+            htf_trends = _higher_timeframe_trends(
+                provider,
+                instrument,
+                risk.get("trend_alignment_timeframes", ["1H", "4H"]),
+            )
+
         ctx = RiskContext(
             account_capital=float(risk.get("account_capital", settings.account_start_capital)),
             open_trades=[{"instrument": t.instrument, "direction": t.direction} for t in open_now],
@@ -163,6 +190,7 @@ def run_scan(db: Session) -> list[TradeIdea]:
             market_open=snap.market_open,
             trading_locked=state.trading_locked,
             account_ccy_per_point=_risk_unit_multiplier(provider, instrument),
+            htf_trends=htf_trends,
         )
         decision = evaluate_proposal(proposal, ctx, risk, strategy)
 
