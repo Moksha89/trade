@@ -25,7 +25,14 @@ SYSTEM_PROMPT = (
     "instrument string in your response; the schema example is illustrative only. "
     "If there is no high-quality setup, return direction and strategy as 'no_trade'. "
     "Never invent prices; base entry/SL/TP on the supplied indicator data. "
-    "Respect a minimum risk/reward of 1:2."
+    "Respect a minimum risk/reward of 1:2. "
+    "When a 'performance_memory' field is present it is OUR ACTUAL realized "
+    "track record for this instrument/direction/strategy (win rate, net AED, "
+    "average R). Weight it heavily: favour instrument+direction+strategy "
+    "combinations with a positive record, lower your confidence when the "
+    "matching record is weak, and return 'no_trade' when that record is clearly "
+    "negative (low win rate and negative net). Do not repeat patterns that have "
+    "consistently lost for us."
 )
 
 SCHEMA_HINT = {
@@ -59,7 +66,7 @@ def build_payload(
     condition: MarketCondition,
     context: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "instrument": instrument,
         "current_price": ind.price,
         "market_classification": condition.value,
@@ -71,6 +78,10 @@ def build_payload(
         "existing_exposure_aed": context.get("existing_exposure_aed", 0),
         "available_risk_budget_aed": context.get("available_risk_budget_aed", 0),
     }
+    memory = context.get("performance_memory")
+    if memory:
+        payload["performance_memory"] = memory
+    return payload
 
 
 def prompt_hash(payload: dict[str, Any]) -> str:

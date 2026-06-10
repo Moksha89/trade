@@ -92,6 +92,8 @@ def default_ai() -> dict[str, Any]:
         "allow_open_trades": False,
         "require_approval": True,
         "auto_mode": False,
+        # Feed our realized track record back into the AI prompt.
+        "performance_memory_enabled": True,
     }
 
 

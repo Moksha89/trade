@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from app.ai.engine import propose_trade
+from app.services.performance import performance_memory
 from app.ai.schema import Direction, EntryType, ManagementPlan, Strategy, TradeProposal
 from app.classifier.engine import classify_market, is_tradeable
 from app.config import settings
@@ -163,6 +164,11 @@ def run_scan(db: Session) -> list[TradeIdea]:
         if not ai_cfg.get("allow_create_ideas", True):
             continue
 
+        memory = (
+            performance_memory(db, instrument)
+            if ai_cfg.get("performance_memory_enabled", True)
+            else {}
+        )
         proposal, payload, phash = propose_trade(
             instrument,
             ind,
@@ -174,6 +180,7 @@ def run_scan(db: Session) -> list[TradeIdea]:
                 "existing_exposure_aed": open_risk,
                 "available_risk_budget_aed": float(risk.get("max_combined_open_risk", 100))
                 - open_risk,
+                "performance_memory": memory,
             },
             model=ai_cfg.get("model"),
         )
