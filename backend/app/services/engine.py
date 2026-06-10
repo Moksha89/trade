@@ -992,6 +992,65 @@ def _protect_and_grade_manual(
                     f"(risk ≤ {trade.initial_risk_aed} AED)"
                 )
 
+    # 1a. Enforce the per-trade risk cap on the stop — even a stop the user set
+    #     by hand. If the current stop sits on the losing side and risks more
+    #     than the cap, tighten it to the cap distance. A stop already trailed
+    #     into profit is left alone (the trailing manager owns it). Re-checked
+    #     each cycle until satisfied so it also fixes already-adopted trades.
+    if live and bool(risk.get("manual_enforce_risk_cap", True)):
+        cap = float(risk.get("max_risk_per_trade", 50))
+        mult = _risk_unit_multiplier(provider, trade.instrument)
+        has_sl = bool(trade.stop_loss) and trade.stop_loss > 0 and abs(trade.stop_loss - entry) > 1e-9
+        # risk side only: long stop below entry, short stop above entry
+        on_risk_side = (is_long and trade.stop_loss < entry) or (
+            (not is_long) and trade.stop_loss > entry
+        )
+        if has_sl and on_risk_side and mult > 0 and trade.size > 0:
+            cur_risk = trade.size * abs(entry - trade.stop_loss) * mult
+            cap_dist = cap / (trade.size * mult)
+            if cur_risk > cap + 0.5 and cap_dist > 0:
+                atr = float(ind.atr or 0.0)
+                try:
+                    q = provider.get_quote(trade.instrument)
+                    cur = q.bid if is_long else q.ask
+                except Exception:  # noqa: BLE001
+                    cur = entry
+                buf = max(atr * 0.5, abs(cur) * 0.0008)
+                if is_long:
+                    capped_sl = round(min(entry - cap_dist, cur - buf), 5)
+                else:
+                    capped_sl = round(max(entry + cap_dist, cur + buf), 5)
+                # Only act if it genuinely tightens (moves the stop toward entry).
+                tighter = (capped_sl > trade.stop_loss) if is_long else (capped_sl < trade.stop_loss)
+                if tighter:
+                    res = executor.modify(trade.deal_id, capped_sl, None)
+                    if res.ok:
+                        old_sl, old_risk = trade.stop_loss, round(cur_risk, 2)
+                        trade.stop_loss = capped_sl
+                        trade.initial_risk_per_unit = abs(entry - capped_sl)
+                        trade.initial_risk_aed = round(
+                            trade.size * abs(entry - capped_sl) * mult, 2
+                        )
+                        trade.last_sltp_update = _utcnow()
+                        log_event(
+                            db, "manual_risk_capped",
+                            {"trade_id": trade.id, "old_sl": old_sl, "new_sl": capped_sl,
+                             "old_risk_aed": old_risk, "cap": cap,
+                             "new_risk_aed": trade.initial_risk_aed},
+                            instrument=trade.instrument,
+                        )
+                        notify(
+                            f"🧷 {trade.instrument} {trade.direction.upper()}: stop risked "
+                            f"{old_risk} AED (over {cap} cap) — tightened to risk "
+                            f"≤ {trade.initial_risk_aed} AED"
+                        )
+                    else:
+                        log_event(
+                            db, "manual_risk_cap_failed",
+                            {"trade_id": trade.id, "intended_sl": capped_sl, "error": res.error},
+                            instrument=trade.instrument,
+                        )
+
     # 1b. Trailing exit: if a manual trade still carries a fixed broker TP (set
     #     before trailing was enabled, or attached manually), remove it once so
     #     the trailing stop is the sole exit and the winner isn't capped early.

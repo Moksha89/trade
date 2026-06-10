@@ -210,6 +210,58 @@ def test_trailing_clears_preexisting_broker_tp(monkeypatch):
     _clear(db)
 
 
+def test_enforce_risk_cap_tightens_wide_user_stop(monkeypatch):
+    db = SessionLocal()
+    _clear(db)
+    # User opened a short and placed their OWN wide stop (entry 100, stop 130 =>
+    # distance 30, size 1, FX 3.6725 => risk ~110 AED, over the 50 cap). The bot
+    # must tighten that stop to the cap distance (~13.6 => risk ~50).
+    t = Trade(
+        idea_id=None, mode="live", instrument="US100", direction="short",
+        strategy="manual", entry_price=100.0, size=1.0, stop_loss=130.0,
+        take_profit_1=0.0, current_price=100.0, status="open",
+        management_plan={"manual_protected": True, "manual_tp_cleared": True},
+        deal_id="DC",
+    )
+    db.add(t)
+    db.commit()
+    _patch_analysis(monkeypatch, 2.0, _sig(False, True, False, True), {"1H": "down", "4H": "down"})
+    calls: list = []
+
+    engine._protect_and_grade_manual(db, _Prov(100.0, 100.0), _exec(calls), t, _risk(True), live=True)
+    db.refresh(t)
+
+    assert 100.0 < t.stop_loss < 130.0  # tightened toward entry, still above (short)
+    assert t.initial_risk_aed <= 50.5   # risk now within the cap
+    assert any(sl is not None for sl, _ in calls)
+    _clear(db)
+
+
+def test_enforce_risk_cap_leaves_profit_locked_stop(monkeypatch):
+    db = SessionLocal()
+    _clear(db)
+    # Short whose stop has already trailed BELOW entry (into profit). The cap
+    # enforcer must NOT touch it (that stop locks profit, risk is negative).
+    t = Trade(
+        idea_id=None, mode="live", instrument="US100", direction="short",
+        strategy="manual", entry_price=100.0, size=1.0, stop_loss=95.0,
+        take_profit_1=0.0, current_price=92.0, status="open",
+        management_plan={"manual_protected": True, "manual_tp_cleared": True},
+        deal_id="DP",
+    )
+    db.add(t)
+    db.commit()
+    _patch_analysis(monkeypatch, 2.0, _sig(False, True, False, True), {"1H": "down", "4H": "down"})
+    calls: list = []
+
+    engine._protect_and_grade_manual(db, _Prov(92.0, 92.0), _exec(calls), t, _risk(True), live=True)
+    db.refresh(t)
+
+    assert t.stop_loss == 95.0  # untouched — profit-side stop owned by the trail
+    assert calls == []
+    _clear(db)
+
+
 def test_protect_clamps_tp_to_valid_side_of_price(monkeypatch):
     db = SessionLocal()
     _clear(db)

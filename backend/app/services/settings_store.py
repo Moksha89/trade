@@ -69,6 +69,9 @@ def default_risk() -> dict[str, Any]:
         # in (breakeven/lock already protect before that).
         "manual_trailing_tp": True,
         "manual_trail_start_R": 1.0,
+        # Hard-cap manual-trade risk at max_risk_per_trade even on a stop the
+        # user placed by hand: tighten an over-risk stop to the cap distance.
+        "manual_enforce_risk_cap": True,
         "hedging_enabled": env.hedging_enabled,
         "news_filter_enabled": True,
         "market_hours_filter_enabled": True,
