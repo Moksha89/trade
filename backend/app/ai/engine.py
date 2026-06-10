@@ -51,10 +51,12 @@ SCHEMA_HINT = {
     "invalidation_condition": "when this setup becomes invalid",
     "risk_flags": [],
     "management_plan": {
-        "move_sl_to_breakeven_at_R": 1.0,
-        "lock_profit_at_R": 1.5,
+        "move_sl_to_breakeven_at_R": 0.7,
+        "lock_profit_at_R": 1.0,
+        "lock_profit_offset_R": 0.3,
         "partial_close_at_R": 2.0,
         "partial_close_percent": 50,
+        "trail_start_R": 2.0,
         "trailing_method": "swing | ema20 | atr",
     },
 }

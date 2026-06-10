@@ -1,11 +1,16 @@
 """Compute deterministic management actions for an open trade.
 
-Implements the spec's rules:
-  +1R   → move stop-loss to breakeven
-  +1.5R → move stop-loss to lock +0.5R
-  +2R or TP1 hit → close `partial_close_percent` (once)
-  after TP1 → trail remaining using the configured method
+Implements the spec's rules (thresholds are configurable per `plan`; defaults
+shown):
+  +0.7R → move stop-loss to breakeven
+  +1.0R → move stop-loss to lock +0.3R (banks profit even if it later reverses)
+  TP1 / +2R → close `partial_close_percent` (once) and start ATR trailing
+  trailing → ratchet the stop to the supplied ATR level (never loosens)
   reversal/invalidation → close
+
+Each tick we recompute every eligible stop (breakeven, profit-lock, trail) and
+move to the *tightest favourable* one, so the protective stop only ever
+ratchets in the trade's favour.
 """
 
 from __future__ import annotations
@@ -64,37 +69,48 @@ def compute_management_actions(
         actions.reasons.append("reversal signal")
         return actions
 
-    be_at = float(plan.get("move_sl_to_breakeven_at_R", 1.0))
-    lock_at = float(plan.get("lock_profit_at_R", 1.5))
+    be_at = float(plan.get("move_sl_to_breakeven_at_R", 0.7))
+    lock_at = float(plan.get("lock_profit_at_R", 1.0))
+    lock_off_r = float(plan.get("lock_profit_offset_R", 0.3))
     partial_at = float(plan.get("partial_close_at_R", 2.0))
     partial_pct = float(plan.get("partial_close_percent", 50))
 
-    def better_sl(candidate: float) -> bool:
-        # Only ever tighten in the favourable direction.
+    def beyond_current(candidate: float) -> bool:
+        # Only ever tighten in the favourable direction past the current stop.
         if direction == "long":
             return candidate > current_sl
         return candidate < current_sl
 
-    # Profit-lock at +1.5R (supersedes breakeven).
-    if r >= lock_at and not profit_locked:
-        lock_offset = 0.5 * risk_per_unit
-        candidate = entry + lock_offset if direction == "long" else entry - lock_offset
-        if better_sl(candidate):
-            actions.new_stop_loss = round(candidate, 5)
-            actions.reasons.append(f"lock +0.5R at {r:.2f}R")
-    elif r >= be_at and not breakeven_done:
-        if better_sl(entry):
-            actions.new_stop_loss = round(entry, 5)
-            actions.reasons.append(f"breakeven at {r:.2f}R")
+    def tighter(a: float, b: float) -> bool:
+        # Is `a` a more favourable (tighter) stop than `b`?
+        return a > b if direction == "long" else a < b
 
-    # Partial close at +2R (once).
+    # Collect every stop that is currently eligible, then move to the tightest
+    # favourable one. Recomputed each tick, so it naturally ratchets and never
+    # loosens (beyond_current guards against moving the stop backwards).
+    candidates: list[tuple[float, str]] = []
+    if r >= be_at:
+        candidates.append((entry, f"breakeven at {r:.2f}R"))
+    if r >= lock_at:
+        offset = lock_off_r * risk_per_unit
+        locked = entry + offset if direction == "long" else entry - offset
+        candidates.append((locked, f"lock +{lock_off_r:g}R at {r:.2f}R"))
+    if trail_level is not None:
+        candidates.append((float(trail_level), "trailing stop"))
+
+    best: tuple[float, str] | None = None
+    for value, reason in candidates:
+        if not beyond_current(value):
+            continue
+        if best is None or tighter(value, best[0]):
+            best = (round(value, 5), reason)
+    if best is not None:
+        actions.new_stop_loss = best[0]
+        actions.reasons.append(best[1])
+
+    # Partial close at the first target (once).
     if r >= partial_at and not partial_done:
         actions.partial_close_percent = partial_pct
         actions.reasons.append(f"partial {partial_pct:.0f}% at {r:.2f}R")
-
-    # Trailing after the partial / first target, if a trail level is supplied.
-    if partial_done and trail_level is not None and better_sl(trail_level):
-        actions.new_stop_loss = round(trail_level, 5)
-        actions.reasons.append("trailing stop")
 
     return actions

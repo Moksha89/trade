@@ -737,8 +737,24 @@ def manage_open_trades(db: Session) -> None:
                     close_trade(db, trade, trade.take_profit_2, "take_profit_2"); db.commit(); continue
 
         plan = trade.management_plan or {}
+        # Start the ATR trail as soon as the first target (TP1) is reached, not
+        # only after a partial — in live mode the partial is the broker's
+        # server-side TP, so gating on it would never let the trail engage.
+        tp1_hit = trade.take_profit_1 and (
+            (trade.direction == "long" and price >= trade.take_profit_1)
+            or (trade.direction == "short" and price <= trade.take_profit_1)
+        )
+        rpu = trade.initial_risk_per_unit or 0.0
+        cur_r = (
+            ((price - trade.entry_price) if trade.direction == "long" else (trade.entry_price - price)) / rpu
+            if rpu > 0
+            else 0.0
+        )
+        trail_started = (
+            trade.partial_closed or tp1_hit or cur_r >= float(plan.get("trail_start_R", 2.0))
+        )
         trail_level = None
-        if trade.partial_closed:
+        if trail_started:
             try:
                 ind = compute_indicators(provider.get_candles(trade.instrument, "5M", 60))
                 if trade.direction == "long":
@@ -761,11 +777,6 @@ def manage_open_trades(db: Session) -> None:
             trail_level=trail_level,
         )
 
-        # TP1 reached without an explicit +2R partial → take the partial there too.
-        tp1_hit = trade.take_profit_1 and (
-            (trade.direction == "long" and price >= trade.take_profit_1)
-            or (trade.direction == "short" and price <= trade.take_profit_1)
-        )
         if actions.close:
             close_trade(db, trade, price, ";".join(actions.reasons) or "managed_close")
             db.commit()
