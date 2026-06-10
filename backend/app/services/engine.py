@@ -889,29 +889,72 @@ def _protect_and_grade_manual(
                 if cap_dist > 0:
                     rpu = min(rpu, cap_dist)
 
+        # Levels must sit on the valid side of the LIVE price, not just the
+        # entry: a position already in profit can have its entry-based target
+        # already behind the market, which the broker rejects. Clamp each level
+        # beyond a min-distance buffer from the current price so the order is
+        # always accepted, and send SL and TP as SEPARATE calls so one rejection
+        # can't void the other.
+        try:
+            q = provider.get_quote(trade.instrument)
+            cur = q.bid if is_long else q.ask
+        except Exception:  # noqa: BLE001
+            cur = entry
+        buf = max(atr * 0.5, abs(cur) * 0.0008)
+
         new_sl = None
         new_tp = None
         if not has_sl and rpu > 0:
-            new_sl = round(entry - rpu, 5) if is_long else round(entry + rpu, 5)
+            if is_long:
+                new_sl = round(min(entry - rpu, cur - buf), 5)
+            else:
+                new_sl = round(max(entry + rpu, cur + buf), 5)
         if not has_tp and rpu > 0:
-            new_tp = round(entry + rpu * rr, 5) if is_long else round(entry - rpu * rr, 5)
+            if is_long:
+                new_tp = round(max(entry + rpu * rr, cur + buf), 5)
+            else:
+                new_tp = round(min(entry - rpu * rr, cur - buf), 5)
 
-        if new_sl is not None or new_tp is not None:
-            res = executor.modify(trade.deal_id, new_sl, new_tp)
+        sl_ok = has_sl
+        tp_ok = has_tp
+        if new_sl is not None:
+            res = executor.modify(trade.deal_id, new_sl, None)
             if res.ok:
-                if new_sl is not None:
-                    trade.stop_loss = new_sl
-                if new_tp is not None:
-                    trade.take_profit_1 = new_tp
-                trade.initial_risk_per_unit = rpu
+                trade.stop_loss = new_sl
+                trade.initial_risk_per_unit = abs(entry - new_sl)
                 if mult > 0:
-                    trade.initial_risk_aed = round(trade.size * rpu * mult, 2)
+                    trade.initial_risk_aed = round(trade.size * abs(entry - new_sl) * mult, 2)
                 trade.last_sltp_update = _utcnow()
-                plan["manual_protected"] = True
+                sl_ok = True
+            else:
+                log_event(
+                    db, "manual_protect_failed",
+                    {"trade_id": trade.id, "field": "sl", "intended_sl": new_sl, "error": res.error},
+                    instrument=trade.instrument,
+                )
+        if new_tp is not None:
+            res = executor.modify(trade.deal_id, None, new_tp)
+            if res.ok:
+                trade.take_profit_1 = new_tp
+                trade.last_sltp_update = _utcnow()
+                tp_ok = True
+            else:
+                log_event(
+                    db, "manual_protect_failed",
+                    {"trade_id": trade.id, "field": "tp", "intended_tp": new_tp, "error": res.error},
+                    instrument=trade.instrument,
+                )
+
+        # Mark protected (stop, the critical guard, attempted) so we don't refire
+        # every cycle. The trailing manager improves the stop from here.
+        if sl_ok or (new_sl is None and new_tp is None):
+            plan["manual_protected"] = True
+            if new_sl is not None or new_tp is not None:
                 log_event(
                     db, "manual_protected",
                     {"trade_id": trade.id, "deal_id": trade.deal_id,
-                     "sl": new_sl, "tp": new_tp, "rpu": rpu},
+                     "sl": trade.stop_loss if sl_ok else None,
+                     "tp": trade.take_profit_1 if tp_ok else None, "rpu": rpu},
                     instrument=trade.instrument,
                 )
                 notify(
@@ -919,19 +962,6 @@ def _protect_and_grade_manual(
                     f"SL {trade.stop_loss} / TP {trade.take_profit_1} "
                     f"(risk ≤ {trade.initial_risk_aed} AED)"
                 )
-            else:
-                log_event(
-                    db, "manual_protect_failed",
-                    {"trade_id": trade.id, "intended_sl": new_sl,
-                     "intended_tp": new_tp, "error": res.error},
-                    instrument=trade.instrument,
-                )
-                notify(
-                    f"⚠️ Couldn't set SL/TP on your manual {trade.instrument} "
-                    f"({res.error}) — will retry next cycle"
-                )
-        else:
-            plan["manual_protected"] = True  # user already set both — nothing to do
 
     # 2. Grade the setup (refreshed each cycle) and surface it on the dashboard.
     grade = _grade_setup(trade.direction, signals, htf_trends)

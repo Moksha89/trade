@@ -68,19 +68,25 @@ def _patch_analysis(monkeypatch, atr, signals, trends):
 
 
 class _Prov:
+    def __init__(self, bid=100.0, ask=100.0):
+        self._bid, self._ask = bid, ask
+
     def get_candles(self, *a, **k):
         return [object()] * 5  # unused: compute_indicators is patched
+
+    def get_quote(self, instrument):
+        return types.SimpleNamespace(bid=self._bid, ask=self._ask)
 
     def risk_unit_multiplier(self, instrument):
         return FX
 
 
-def _exec(captured):
+def _exec(calls):
     class _E:
         mode = "live"
 
         def modify(self, deal_id, sl, tp):
-            captured["sl"], captured["tp"] = sl, tp
+            calls.append((sl, tp))
             return types.SimpleNamespace(ok=True, error=None)
 
     return _E()
@@ -99,13 +105,15 @@ def test_protect_attaches_sltp_when_missing(monkeypatch):
     db.add(t)
     db.commit()
     _patch_analysis(monkeypatch, 2.0, _sig(True, False, True, False), {"1H": "up", "4H": "up"})
-    captured: dict = {}
+    calls: list = []
 
-    engine._protect_and_grade_manual(db, _Prov(), _exec(captured), t, default_risk(), live=True)
+    # Price still at entry (100): ATR stop 3.0 below, TP 6.0 above; both clear
+    # the min-distance buffer so the entry-based levels stand.
+    engine._protect_and_grade_manual(db, _Prov(100.0, 100.0), _exec(calls), t, default_risk(), live=True)
     db.refresh(t)
 
-    # ATR-based stop = 2.0 * 1.5 = 3.0 below entry; TP at RR 2.0 = 6.0 above.
-    assert captured["sl"] == 97.0 and captured["tp"] == 106.0
+    # SL and TP are sent as separate calls.
+    assert (97.0, None) in calls and (None, 106.0) in calls
     assert t.stop_loss == 97.0 and t.take_profit_1 == 106.0
     assert t.management_plan["manual_protected"] is True
     assert t.management_plan["grade"] == "good"
@@ -126,14 +134,41 @@ def test_protect_keeps_existing_user_stop(monkeypatch):
     db.add(t)
     db.commit()
     _patch_analysis(monkeypatch, 2.0, _sig(True, False, True, False), {"1H": "up", "4H": "up"})
-    captured: dict = {}
+    calls: list = []
 
-    engine._protect_and_grade_manual(db, _Prov(), _exec(captured), t, default_risk(), live=True)
+    engine._protect_and_grade_manual(db, _Prov(100.0, 100.0), _exec(calls), t, default_risk(), live=True)
     db.refresh(t)
 
-    assert captured["sl"] is None  # user's stop untouched
-    assert captured["tp"] == 110.0  # entry + 5.0 * RR(2.0)
+    # Only a TP call (entry + 5.0 * RR 2.0 = 110); the user's stop is untouched.
+    assert calls == [(None, 110.0)]
     assert t.stop_loss == 95.0 and t.take_profit_1 == 110.0
+    _clear(db)
+
+
+def test_protect_clamps_tp_to_valid_side_of_price(monkeypatch):
+    db = SessionLocal()
+    _clear(db)
+    # Short already in profit: entry 4105.2, no stop/TP, price has fallen to
+    # 4087 (past the entry-based 2R target). The TP must be clamped BELOW the
+    # live price (minus buffer), not left above it where the broker rejects it.
+    t = Trade(
+        idea_id=None, mode="live", instrument="GOLD", direction="short",
+        strategy="manual", entry_price=4105.2, size=0.05, stop_loss=4105.2,
+        take_profit_1=0.0, current_price=4087.0, status="open",
+        management_plan={}, deal_id="DG",
+    )
+    db.add(t)
+    db.commit()
+    _patch_analysis(monkeypatch, 4.5, _sig(True, False, False, True), {"1H": "down", "4H": "down"})
+    calls: list = []
+
+    engine._protect_and_grade_manual(db, _Prov(4087.0, 4087.0), _exec(calls), t, default_risk(), live=True)
+    db.refresh(t)
+
+    # Stop sits above the live ask; target sits below the live bid (buffer applied).
+    assert t.stop_loss > 4087.0
+    assert t.take_profit_1 < 4087.0
+    assert t.management_plan["manual_protected"] is True
     _clear(db)
 
 
@@ -149,17 +184,10 @@ def test_protect_only_runs_once(monkeypatch):
     db.add(t)
     db.commit()
     _patch_analysis(monkeypatch, 2.0, _sig(False, True, False, True), {"1H": "down", "4H": "down"})
-
     calls: list = []
 
-    class _E:
-        mode = "live"
-
-        def modify(self, deal_id, sl, tp):
-            calls.append((sl, tp))
-            return types.SimpleNamespace(ok=True, error=None)
-
-    engine._protect_and_grade_manual(db, _Prov(), _E(), t, default_risk(), live=True)
-    engine._protect_and_grade_manual(db, _Prov(), _E(), t, default_risk(), live=True)
-    assert len(calls) == 1  # second pass sees manual_protected and skips modify
+    engine._protect_and_grade_manual(db, _Prov(100.0, 100.0), _exec(calls), t, default_risk(), live=True)
+    first = len(calls)
+    engine._protect_and_grade_manual(db, _Prov(100.0, 100.0), _exec(calls), t, default_risk(), live=True)
+    assert first >= 1 and len(calls) == first  # second pass skips modify entirely
     _clear(db)
