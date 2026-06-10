@@ -644,16 +644,22 @@ def _mark_to_market(trade: Trade, price: float) -> None:
         trade.unrealized_pl = round(trade.size * (trade.entry_price - price) * mult, 2)
 
 
-def close_trade(db: Session, trade: Trade, price: float, reason: str) -> None:
+def close_trade(db: Session, trade: Trade, price: float, reason: str) -> bool:
     # Send the real close first so we can book P/L at the actual fill and alert
     # if the broker rejects it (e.g. the position was already closed).
     executor = get_executor()
     res = executor.close(trade.deal_id, price)
-    fill = res.fill_price if (res and res.ok and res.fill_price) else price
     if res and not res.ok:
+        # The broker did NOT close the position. Do not mark it closed in the DB:
+        # that would leave a live, unmanaged position off-book and double-count its
+        # P/L when the reconcile loop re-adopts it. Keep it open so the next manage
+        # cycle retries the close (or _reconcile_closed_on_broker books it if the
+        # position genuinely disappeared at the broker).
         log_event(db, "close_failed", {"trade_id": trade.id, "error": res.error},
                   instrument=trade.instrument)
-        notify(f"⚠️ {trade.instrument} close may have failed: {res.error}")
+        notify(f"⚠️ {trade.instrument} close FAILED, still open: {res.error}")
+        return False
+    fill = res.fill_price if (res and res.fill_price) else price
     mult = _ccy_mult(trade)
     if trade.direction == "long":
         pl = trade.size * (fill - trade.entry_price) * mult
@@ -672,6 +678,7 @@ def close_trade(db: Session, trade: Trade, price: float, reason: str) -> None:
         instrument=trade.instrument,
     )
     notify(f"🔚 Closed {trade.instrument} ({reason}) | P/L {trade.realized_pl:+.2f}")
+    return True
 
 
 def _partial_close(db: Session, trade: Trade, price: float, pct: float) -> None:
