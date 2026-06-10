@@ -50,6 +50,11 @@ def default_risk() -> dict[str, Any]:
         "require_htf_bias": True,  # trade must be WITH a higher-tf trend
         "require_location_filter": True,  # buy at support / sell at resistance
         "support_zone_pct": 0.75,  # how near a level counts as "at" it
+        # Breakdown exception (shorts only): allow a short at support when the
+        # higher-tf trend is down and there is room below — captures the bearish
+        # continuation instead of blocking every short at a level.
+        "allow_short_at_support_in_downtrend": True,
+        "min_support_room_atr": 0.25,  # min ATRs of room below to qualify
         "require_confirmation": True,  # confirmation candle + momentum
         "min_reward_atr": 1.0,  # anti-scalp: target ≥ N×ATR away
         "min_volatility_pct": 0.03,  # skip dead markets

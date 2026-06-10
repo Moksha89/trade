@@ -67,23 +67,29 @@ def _risk_unit_multiplier(provider: MarketDataProvider, instrument: str) -> floa
         return 0.0
 
 
-def _entry_signals(ind, candles, zone_pct: float) -> dict[str, bool]:
+def _entry_signals(ind, candles, zone_pct: float) -> dict:
     """Setup-quality signals from the entry-timeframe indicators and candles.
 
     - at_support / at_resistance: price sits within `zone_pct`% of a swing level.
     - bullish/bearish_confirmation: latest candle direction agrees with MACD
       momentum (no buying into bearish momentum / shorting into bullish).
+    - support_room_atr: how many ATRs of room sit below price down to the nearest
+      support (0 if price is at/under support). Lets a breakdown short distinguish
+      "falling toward support with room to run" from "sitting right on the floor".
     """
     price = float(ind.price)
     zone = zone_pct / 100.0
     at_support = price > 0 and abs(price - ind.support) / price <= zone
     at_resistance = price > 0 and abs(ind.resistance - price) / price <= zone
+    atr = float(ind.atr)
+    support_room_atr = (price - float(ind.support)) / atr if atr > 0 and price > ind.support else 0.0
     last = candles[-1]
     green = last.close > last.open
     red = last.close < last.open
     return {
         "at_support": bool(at_support),
         "at_resistance": bool(at_resistance),
+        "support_room_atr": float(support_room_atr),
         "bullish_confirmation": bool(green and ind.macd_hist > 0),
         "bearish_confirmation": bool(red and ind.macd_hist < 0),
     }
@@ -326,6 +332,7 @@ def run_scan(db: Session) -> list[TradeIdea]:
             htf_trends=htf_trends,
             at_support=signals["at_support"],
             at_resistance=signals["at_resistance"],
+            support_room_atr=signals["support_room_atr"],
             bullish_confirmation=signals["bullish_confirmation"],
             bearish_confirmation=signals["bearish_confirmation"],
             volatility_pct=float(ind.volatility_pct),

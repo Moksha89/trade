@@ -41,6 +41,7 @@ class RiskContext:
     # Setup-quality signals computed from the entry-timeframe indicators/candles.
     at_support: bool = False  # price sits near a support level
     at_resistance: bool = False  # price sits near a resistance level
+    support_room_atr: float = 0.0  # ATRs of room below price down to nearest support
     bullish_confirmation: bool = False  # up candle + positive momentum
     bearish_confirmation: bool = False  # down candle + negative momentum
     volatility_pct: float = 0.0  # ATR as % of price
@@ -144,6 +145,13 @@ def evaluate_proposal(
         # 4d. Entry location. Buy at support with room above; sell at resistance
         # with room below. Never buy into resistance or sell into support — the
         # dominant BUY failure mode (buying straight into overhead supply).
+        #
+        # Breakdown exception (shorts only): in a confirmed higher-timeframe
+        # downtrend, price sitting at support is often a breakdown about to
+        # continue down, not a floor that holds — so blocking every short at
+        # support makes the bot miss the move. When the trend is down AND there is
+        # still measurable room below to the support being tested, allow the short.
+        # Longs (into resistance) are deliberately left strict.
         if risk.get("require_location_filter", True):
             if proposal.direction == Direction.LONG:
                 if ctx.at_resistance:
@@ -151,9 +159,15 @@ def evaluate_proposal(
                 if not ctx.at_support:
                     return reject("Long not at support")
             else:
-                if ctx.at_support:
+                htf_down = any(tr == "down" for tr in ctx.htf_trends.values())
+                breakdown_ok = (
+                    risk.get("allow_short_at_support_in_downtrend", True)
+                    and htf_down
+                    and ctx.support_room_atr >= float(risk.get("min_support_room_atr", 0.25))
+                )
+                if ctx.at_support and not breakdown_ok:
                     return reject("Short into support")
-                if not ctx.at_resistance:
+                if not ctx.at_resistance and not breakdown_ok:
                     return reject("Short not at resistance")
 
         # 4e. Confirmation candle + momentum. No buying into bearish momentum and
