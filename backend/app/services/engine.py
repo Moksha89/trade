@@ -881,12 +881,12 @@ def _enforce_stop_risk_cap(
         cur = q.bid if is_long else q.ask
     except Exception:  # noqa: BLE001
         cur = entry
-    atr = 0.0
-    try:
-        atr = float(compute_indicators(provider.get_candles(trade.instrument, "5M", 60)).atr or 0.0)
-    except Exception:  # noqa: BLE001
-        atr = 0.0
-    buf = max(atr * 0.5, abs(cur) * 0.0008)
+    # Cap path uses only a tiny price-based buffer (enough to keep the stop off
+    # the live price so the broker accepts it). Unlike the trailing path we do
+    # NOT pad by ATR here: padding would stop us reaching the cap distance on
+    # large positions, leaving risk stuck above the cap. Honouring the cap is
+    # the priority — a slightly tighter stop is the accepted trade-off.
+    buf = abs(cur) * 0.0003
     if is_long:
         capped_sl = round(min(entry - cap_dist, cur - buf), 5)
     else:
