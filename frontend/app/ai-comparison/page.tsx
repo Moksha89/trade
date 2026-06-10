@@ -17,7 +17,10 @@ export default function AIComparisonPage() {
 
   const refresh = useCallback(() => {
     getAIComparison(150)
-      .then(setData)
+      .then((d) => {
+        setData(d);
+        setError(null);
+      })
       .catch((e) => setError((e as Error).message));
   }, []);
 
@@ -43,18 +46,28 @@ export default function AIComparisonPage() {
 
   const s = data?.summary;
   const ollamaOk = data?.ollama?.reachable;
+  // Distinguish "still connecting to the API" from a genuine "shadow off /
+  // ollama offline" state, so a slow/restarting backend never looks like
+  // everything is switched off.
+  const loaded = data !== null;
 
   return (
     <Shell>
       <div className="row spread">
         <h2 className="page-title">AI Comparison — Claude vs Local (Ollama)</h2>
         <div className="row">
-          <span className={`pill ${ollamaOk ? "on" : "off"}`}>
-            Ollama {ollamaOk ? `online${data?.ollama?.version ? " v" + data.ollama.version : ""}` : "offline"}
-          </span>
-          <button className={data?.enabled ? "secondary sm" : "sm"} disabled={busy} onClick={toggle}>
-            {data?.enabled ? "Shadow: ON (click to pause)" : "Shadow: OFF (click to enable)"}
-          </button>
+          {!loaded ? (
+            <span className="pill">Connecting…</span>
+          ) : (
+            <>
+              <span className={`pill ${ollamaOk ? "on" : "off"}`}>
+                Ollama {ollamaOk ? `online${data?.ollama?.version ? " v" + data.ollama.version : ""}` : "offline"}
+              </span>
+              <button className={data?.enabled ? "secondary sm" : "sm"} disabled={busy} onClick={toggle}>
+                {data?.enabled ? "Shadow: ON (click to pause)" : "Shadow: OFF (click to enable)"}
+              </button>
+            </>
+          )}
         </div>
       </div>
 
@@ -119,7 +132,9 @@ export default function AIComparisonPage() {
           <tbody>
             {(!data || data.recent.length === 0) && (
               <tr>
-                <td colSpan={7} className="muted">No comparisons yet.</td>
+                <td colSpan={7} className="muted">
+                  {!loaded ? "Connecting to the API…" : "No comparisons yet."}
+                </td>
               </tr>
             )}
             {data?.recent.map((r) => (
