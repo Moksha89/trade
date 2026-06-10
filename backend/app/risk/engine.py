@@ -38,6 +38,13 @@ class RiskContext:
     # Each value is one of "up" | "down" | "sideways". Used to block trades that
     # fight the higher-timeframe trend. Empty disables the check.
     htf_trends: dict[str, str] = field(default_factory=dict)
+    # Setup-quality signals computed from the entry-timeframe indicators/candles.
+    at_support: bool = False  # price sits near a support level
+    at_resistance: bool = False  # price sits near a resistance level
+    bullish_confirmation: bool = False  # up candle + positive momentum
+    bearish_confirmation: bool = False  # down candle + negative momentum
+    volatility_pct: float = 0.0  # ATR as % of price
+    atr: float = 0.0  # absolute ATR (quote currency), for anti-scalp distance
 
 
 @dataclass
@@ -63,7 +70,16 @@ def evaluate_proposal(
     ctx: RiskContext,
     risk: dict[str, Any],
     strategy: dict[str, Any],
+    skip_setup_quality: bool = False,
 ) -> RiskDecision:
+    """Approve/reject a proposal.
+
+    `skip_setup_quality` bypasses the setup-pattern gates (trend alignment,
+    higher-tf bias, support/resistance location, confirmation candle, volatility
+    band, anti-scalp). Those are validated at scan time; the execution-time
+    re-check only needs to re-verify dynamic risk (locks, losses, spread, size).
+    """
+
     def reject(reason: str) -> RiskDecision:
         return RiskDecision(approved=False, reason=reason)
 
@@ -100,20 +116,65 @@ def evaluate_proposal(
             f"Confidence {proposal.confidence:.0f} below threshold {min_conf:.0f}"
         )
 
-    # 4b. Higher-timeframe trend alignment. Reject trades that fight the higher
-    # timeframe trend — no longs while a higher timeframe is trending down, no
-    # shorts while it is trending up. A "sideways"/neutral timeframe never
-    # blocks; only a directly opposing trend does. This stops the counter-trend,
-    # low-conviction entries (e.g. buying into a 4H downtrend) that repeatedly
-    # got stopped out.
-    if risk.get("trend_alignment_enabled", True) and ctx.htf_trends:
-        opposing = "down" if proposal.direction == Direction.LONG else "up"
-        against = [tf for tf, tr in ctx.htf_trends.items() if tr == opposing]
-        if against:
-            return reject(
-                f"Counter-trend: {proposal.direction.value} vs "
-                f"{'/'.join(sorted(against))} {opposing}trend"
-            )
+    # 4b–4f. Setup-quality selection filter. Skipped on the execution re-check.
+    if not skip_setup_quality:
+        # 4b. Higher-timeframe trend alignment. Reject trades that fight the
+        # higher timeframe trend — no longs while a higher timeframe is trending
+        # down, no shorts while it is trending up. A "sideways"/neutral timeframe
+        # never blocks; only a directly opposing trend does. This stops the
+        # counter-trend entries (e.g. buying into a 4H downtrend) that repeatedly
+        # got stopped out.
+        if risk.get("trend_alignment_enabled", True) and ctx.htf_trends:
+            opposing = "down" if proposal.direction == Direction.LONG else "up"
+            against = [tf for tf, tr in ctx.htf_trends.items() if tr == opposing]
+            if against:
+                return reject(
+                    f"Counter-trend: {proposal.direction.value} vs "
+                    f"{'/'.join(sorted(against))} {opposing}trend"
+                )
+
+        # 4c. Higher-timeframe directional bias. Stricter than 4b: the trade must
+        # be WITH a higher-timeframe trend, not merely non-opposing. A long needs
+        # at least one higher timeframe up; a short needs one down.
+        if risk.get("require_htf_bias", True) and ctx.htf_trends:
+            favouring = "up" if proposal.direction == Direction.LONG else "down"
+            if not any(tr == favouring for tr in ctx.htf_trends.values()):
+                return reject(f"No higher-timeframe {favouring}trend bias")
+
+        # 4d. Entry location. Buy at support with room above; sell at resistance
+        # with room below. Never buy into resistance or sell into support — the
+        # dominant BUY failure mode (buying straight into overhead supply).
+        if risk.get("require_location_filter", True):
+            if proposal.direction == Direction.LONG:
+                if ctx.at_resistance:
+                    return reject("Long into resistance")
+                if not ctx.at_support:
+                    return reject("Long not at support")
+            else:
+                if ctx.at_support:
+                    return reject("Short into support")
+                if not ctx.at_resistance:
+                    return reject("Short not at resistance")
+
+        # 4e. Confirmation candle + momentum. No buying into bearish momentum and
+        # no shorting into bullish momentum — require the latest candle and MACD
+        # to agree with the trade direction.
+        if risk.get("require_confirmation", True):
+            if proposal.direction == Direction.LONG and not ctx.bullish_confirmation:
+                return reject("No bullish confirmation candle")
+            if proposal.direction == Direction.SHORT and not ctx.bearish_confirmation:
+                return reject("No bearish confirmation candle")
+
+        # 4f. Volatility band. Skip dead markets (nothing to capture) and chaotic
+        # ones (stops get blown through).
+        if ctx.volatility_pct > 0:
+            vmin = float(risk.get("min_volatility_pct", 0.03))
+            vmax = float(risk.get("max_volatility_pct", 8.0))
+            if not (vmin <= ctx.volatility_pct <= vmax):
+                return reject(
+                    f"Volatility {ctx.volatility_pct:.2f}% outside band "
+                    f"{vmin:g}-{vmax:g}%"
+                )
 
     # 5. Valid SL/TP geometry (no trade without SL + TP).
     entry = proposal.entry_price
@@ -136,6 +197,17 @@ def evaluate_proposal(
     min_rr = float(risk.get("min_risk_reward", 2.0))
     if rr < min_rr - 1e-9:
         return reject(f"Risk/reward {rr:.2f} below minimum {min_rr:.2f}")
+
+    # 6b. Anti-scalp. The target must be a real move, not a tight scalp that the
+    # spread and noise eat. Require the reward distance to be a multiple of ATR
+    # so the bot trades structure, not micro instant trades.
+    if not skip_setup_quality:
+        min_reward_atr = float(risk.get("min_reward_atr", 1.0))
+        if ctx.atr > 0 and reward < min_reward_atr * ctx.atr:
+            return reject(
+                f"Target {reward:.4g} too close (<{min_reward_atr:g}x ATR "
+                f"{ctx.atr:.4g}) — scalp"
+            )
 
     # 7. Stop-loss distance not too wide.
     max_sl_pct = float(risk.get("max_sl_distance_pct", 2.0))

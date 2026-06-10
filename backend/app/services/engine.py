@@ -64,6 +64,28 @@ def _risk_unit_multiplier(provider: MarketDataProvider, instrument: str) -> floa
         return 0.0
 
 
+def _entry_signals(ind, candles, zone_pct: float) -> dict[str, bool]:
+    """Setup-quality signals from the entry-timeframe indicators and candles.
+
+    - at_support / at_resistance: price sits within `zone_pct`% of a swing level.
+    - bullish/bearish_confirmation: latest candle direction agrees with MACD
+      momentum (no buying into bearish momentum / shorting into bullish).
+    """
+    price = float(ind.price)
+    zone = zone_pct / 100.0
+    at_support = price > 0 and abs(price - ind.support) / price <= zone
+    at_resistance = price > 0 and abs(ind.resistance - price) / price <= zone
+    last = candles[-1]
+    green = last.close > last.open
+    red = last.close < last.open
+    return {
+        "at_support": bool(at_support),
+        "at_resistance": bool(at_resistance),
+        "bullish_confirmation": bool(green and ind.macd_hist > 0),
+        "bearish_confirmation": bool(red and ind.macd_hist < 0),
+    }
+
+
 def _higher_timeframe_trends(
     provider: MarketDataProvider, instrument: str, timeframes: list[str]
 ) -> dict[str, str]:
@@ -170,12 +192,19 @@ def run_scan(db: Session) -> list[TradeIdea]:
         )
 
         htf_trends: dict[str, str] = {}
-        if proposal.is_trade and risk.get("trend_alignment_enabled", True):
+        if proposal.is_trade and (
+            risk.get("trend_alignment_enabled", True)
+            or risk.get("require_htf_bias", True)
+        ):
             htf_trends = _higher_timeframe_trends(
                 provider,
                 instrument,
                 risk.get("trend_alignment_timeframes", ["1H", "4H"]),
             )
+
+        signals = _entry_signals(
+            ind, candles, float(risk.get("support_zone_pct", 0.75))
+        )
 
         ctx = RiskContext(
             account_capital=float(risk.get("account_capital", settings.account_start_capital)),
@@ -191,6 +220,12 @@ def run_scan(db: Session) -> list[TradeIdea]:
             trading_locked=state.trading_locked,
             account_ccy_per_point=_risk_unit_multiplier(provider, instrument),
             htf_trends=htf_trends,
+            at_support=signals["at_support"],
+            at_resistance=signals["at_resistance"],
+            bullish_confirmation=signals["bullish_confirmation"],
+            bearish_confirmation=signals["bearish_confirmation"],
+            volatility_pct=float(ind.volatility_pct),
+            atr=float(ind.atr),
         )
         decision = evaluate_proposal(proposal, ctx, risk, strategy)
 
@@ -328,7 +363,16 @@ def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
     # live spread feeds the stop-vs-spread quality gate in the risk engine.
     exec_entry, exec_spread = _execution_entry_and_spread(provider, idea)
     ctx.spread_points = exec_spread
-    recheck = evaluate_proposal(_proposal_from_idea(idea, exec_entry), ctx, risk, strategy)
+    # Setup-quality gates (trend/location/confirmation/scalp) were validated at
+    # scan time; the execution re-check only re-verifies dynamic risk so a tiny
+    # price wiggle near a level can't flip a validated setup at the last moment.
+    recheck = evaluate_proposal(
+        _proposal_from_idea(idea, exec_entry),
+        ctx,
+        risk,
+        strategy,
+        skip_setup_quality=True,
+    )
     if not recheck.approved:
         idea.status = "rejected"
         idea.risk_reason = f"blocked at execution: {recheck.reason}"

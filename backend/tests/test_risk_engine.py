@@ -24,8 +24,42 @@ def _ctx(**kw):
     return RiskContext(**base)
 
 
-RISK = default_risk()
+# Legacy tests target the geometry/RR/spread/sizing gates. The setup-location
+# and confirmation-candle gates are exercised by their own dedicated tests
+# below, so disable them here to keep these focused.
+RISK = {
+    **default_risk(),
+    "require_location_filter": False,
+    "require_confirmation": False,
+}
+STRICT = default_risk()  # all setup-quality gates enabled
 STRAT = default_strategy()
+
+
+def _good_long_ctx(**kw):
+    """Context whose setup-quality signals all pass for a long."""
+    base = dict(
+        account_capital=5000.0,
+        at_support=True,
+        at_resistance=False,
+        bullish_confirmation=True,
+        htf_trends={"1H": "up", "4H": "up"},
+    )
+    base.update(kw)
+    return RiskContext(**base)
+
+
+def _good_short_ctx(**kw):
+    """Context whose setup-quality signals all pass for a short."""
+    base = dict(
+        account_capital=5000.0,
+        at_support=False,
+        at_resistance=True,
+        bearish_confirmation=True,
+        htf_trends={"1H": "down", "4H": "down"},
+    )
+    base.update(kw)
+    return RiskContext(**base)
 
 
 def test_valid_long_approved_and_sized():
@@ -216,7 +250,7 @@ def test_short_allowed_when_higher_tf_down_or_sideways():
 
 
 def test_trend_alignment_disabled_allows_counter_trend():
-    risk = {**RISK, "trend_alignment_enabled": False}
+    risk = {**RISK, "trend_alignment_enabled": False, "require_htf_bias": False}
     d = evaluate_proposal(_long(), _ctx(htf_trends={"1H": "down", "4H": "down"}), risk, STRAT)
     assert d.approved
 
@@ -225,3 +259,70 @@ def test_no_htf_data_does_not_block():
     # Empty htf_trends (data hiccup) must not fabricate a block.
     d = evaluate_proposal(_long(), _ctx(htf_trends={}), RISK, STRAT)
     assert d.approved
+
+
+# --- Setup-quality selection filter (4c–4f, 6b) ---
+
+def test_long_requires_htf_bullish_bias():
+    # 1H/4H both sideways -> no bullish bias -> blocked even though not opposing.
+    d = evaluate_proposal(_long(), _good_long_ctx(htf_trends={"1H": "sideways", "4H": "sideways"}), STRICT, STRAT)
+    assert not d.approved and "bias" in d.reason
+
+
+def test_long_blocked_when_not_at_support():
+    d = evaluate_proposal(_long(), _good_long_ctx(at_support=False), STRICT, STRAT)
+    assert not d.approved and "not at support" in d.reason
+
+
+def test_long_blocked_when_into_resistance():
+    d = evaluate_proposal(_long(), _good_long_ctx(at_resistance=True), STRICT, STRAT)
+    assert not d.approved and "into resistance" in d.reason
+
+
+def test_long_blocked_without_bullish_confirmation():
+    d = evaluate_proposal(_long(), _good_long_ctx(bullish_confirmation=False), STRICT, STRAT)
+    assert not d.approved and "confirmation" in d.reason
+
+
+def test_long_approved_with_full_quality_setup():
+    d = evaluate_proposal(_long(), _good_long_ctx(), STRICT, STRAT)
+    assert d.approved, d.reason
+
+
+def test_short_requires_resistance_and_bearish_confirmation():
+    d = evaluate_proposal(_short(), _good_short_ctx(), STRICT, STRAT)
+    assert d.approved, d.reason
+    d2 = evaluate_proposal(_short(), _good_short_ctx(at_resistance=False), STRICT, STRAT)
+    assert not d2.approved and "not at resistance" in d2.reason
+    d3 = evaluate_proposal(_short(), _good_short_ctx(bearish_confirmation=False), STRICT, STRAT)
+    assert not d3.approved and "confirmation" in d3.reason
+
+
+def test_anti_scalp_blocks_tight_target():
+    # reward = |102-100| = 2.0; ATR 3.0 -> need >= 3.0 -> blocked as scalp.
+    d = evaluate_proposal(_long(), _good_long_ctx(atr=3.0), STRICT, STRAT)
+    assert not d.approved and "scalp" in d.reason
+
+
+def test_anti_scalp_allows_real_move():
+    # reward 2.0 vs ATR 1.0 -> passes (2x ATR).
+    d = evaluate_proposal(_long(), _good_long_ctx(atr=1.0), STRICT, STRAT)
+    assert d.approved, d.reason
+
+
+def test_volatility_band_blocks_chaotic_market():
+    d = evaluate_proposal(_long(), _good_long_ctx(volatility_pct=12.0), STRICT, STRAT)
+    assert not d.approved and "Volatility" in d.reason
+
+
+def test_volatility_band_blocks_dead_market():
+    d = evaluate_proposal(_long(), _good_long_ctx(volatility_pct=0.001), STRICT, STRAT)
+    assert not d.approved and "Volatility" in d.reason
+
+
+def test_setup_filters_toggle_off():
+    risk = {**STRICT, "require_htf_bias": False, "require_location_filter": False,
+            "require_confirmation": False, "min_reward_atr": 0.0}
+    # Bare ctx (no support/confirmation signals) is approved when filters are off.
+    d = evaluate_proposal(_long(), _ctx(), risk, STRAT)
+    assert d.approved, d.reason

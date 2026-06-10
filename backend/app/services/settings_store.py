@@ -46,6 +46,14 @@ def default_risk() -> dict[str, Any]:
         "max_sl_distance_pct": 2.0,
         "trend_alignment_enabled": True,
         "trend_alignment_timeframes": ["1H", "4H"],
+        # Setup-quality selection filter (stricter, esp. for BUYs).
+        "require_htf_bias": True,  # trade must be WITH a higher-tf trend
+        "require_location_filter": True,  # buy at support / sell at resistance
+        "support_zone_pct": 0.75,  # how near a level counts as "at" it
+        "require_confirmation": True,  # confirmation candle + momentum
+        "min_reward_atr": 1.0,  # anti-scalp: target ≥ N×ATR away
+        "min_volatility_pct": 0.03,  # skip dead markets
+        "max_volatility_pct": 8.0,  # skip chaotic markets
         "hedging_enabled": env.hedging_enabled,
         "news_filter_enabled": True,
         "market_hours_filter_enabled": True,
