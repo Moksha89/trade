@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     # containers reach the host's Ollama via the Docker bridge gateway.
     ollama_base_url: str = "http://172.18.0.1:11434"
     ollama_model: str = "qwen2.5:7b-instruct"
-    ollama_timeout_seconds: float = 120.0
+    ollama_timeout_seconds: float = 240.0
 
     # Risk engine defaults (AED). These seed the DB-backed risk settings on first run.
     account_start_capital: float = 5000

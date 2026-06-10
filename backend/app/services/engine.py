@@ -11,6 +11,7 @@ live execution is used automatically when Capital.com credentials are present.
 
 from __future__ import annotations
 
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -105,6 +106,37 @@ def _higher_timeframe_trends(
         except Exception:  # noqa: BLE001
             continue
     return trends
+
+
+_shadow_lock = threading.Lock()
+
+
+def _spawn_shadow_batch(queue: list[tuple], shadow_model: str | None) -> None:
+    """Process a batch of shadow comparisons in a background daemon thread.
+
+    Uses a non-blocking lock so only one batch runs at a time; if a previous
+    batch is still in flight (CPU inference is slow) we simply skip this scan's
+    shadow rather than stacking work. Each call gets its own DB session.
+    """
+
+    def _worker() -> None:
+        if not _shadow_lock.acquire(blocking=False):
+            return  # a batch is already running — skip this one
+        try:
+            from app.db import SessionLocal
+
+            db = SessionLocal()
+            try:
+                for instrument, payload, phash, classification, proposal, c_lat in queue:
+                    _record_shadow(
+                        db, instrument, payload, phash, classification, proposal, c_lat, shadow_model
+                    )
+            finally:
+                db.close()
+        finally:
+            _shadow_lock.release()
+
+    threading.Thread(target=_worker, name="shadow-batch", daemon=True).start()
 
 
 def _record_shadow(
@@ -355,12 +387,12 @@ def run_scan(db: Session) -> list[TradeIdea]:
 
     db.commit()
 
-    # Shadow pilot: now that every live decision is recorded, run the local
-    # model on the same payloads and log both side by side. This is the slow
-    # part (CPU inference), deliberately done last so it never delays a trade.
-    shadow_model = ai_cfg.get("shadow_model")
-    for instrument, payload, phash, classification, proposal, c_lat in shadow_queue:
-        _record_shadow(db, instrument, payload, phash, classification, proposal, c_lat, shadow_model)
+    # Shadow pilot: hand the queued payloads to a background thread so the slow
+    # local-model inference (tens of seconds each on CPU) never delays a live
+    # trade decision NOR throttles the 5-minute scan cadence. A single batch
+    # runs at a time; if one is still in flight we skip this scan's shadow.
+    if shadow_queue:
+        _spawn_shadow_batch(shadow_queue, ai_cfg.get("shadow_model"))
 
     return created
 

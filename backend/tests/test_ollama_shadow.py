@@ -73,6 +73,36 @@ def test_leaves_0_100_confidence_unchanged(monkeypatch):
     assert prop.confidence == 72.0
 
 
+def test_maps_buy_sell_synonyms_to_long_short(monkeypatch):
+    raw = json.dumps({"instrument": "GOLD", "direction": "BUY", "strategy": "whatever"})
+    monkeypatch.setattr(ollama_engine, "_post_chat", lambda *a, **k: raw)
+    prop, _ = ollama_engine.propose_trade_ollama(_payload())
+    assert prop.direction == Direction.LONG
+    # Unknown strategy on a real trade falls back to a valid enum, not an error.
+    assert prop.strategy.value in {
+        "trend_pullback", "breakout_retest", "breakdown_retest",
+        "range_reversal", "momentum_continuation",
+    }
+
+
+def test_coerces_string_and_null_numeric_fields(monkeypatch):
+    raw = json.dumps(
+        {
+            "instrument": "GOLD",
+            "direction": "short",
+            "strategy": "trend_pullback",
+            "entry_price": "2,000.5",
+            "stop_loss": None,
+            "confidence": "72%",
+        }
+    )
+    monkeypatch.setattr(ollama_engine, "_post_chat", lambda *a, **k: raw)
+    prop, _ = ollama_engine.propose_trade_ollama(_payload())
+    assert prop.entry_price == 2000.5
+    assert prop.stop_loss == 0.0
+    assert prop.confidence == 72.0
+
+
 def test_propagates_errors_for_caller_to_swallow(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("connection refused")

@@ -82,13 +82,59 @@ def propose_trade_ollama(
     data = json.loads(text)
     # Echo the correct instrument in case the model copied the schema example.
     data["instrument"] = payload.get("instrument", data.get("instrument", ""))
-    # Normalise confidence to a 0–100 scale: some local models return 0–1
-    # (e.g. 0.7) where Claude returns 70, which would skew the comparison.
+    _coerce(data)
+    proposal = TradeProposal.model_validate(data)
+    return proposal, latency_ms
+
+
+# Map common phrasings a local model emits onto our strict enums so an
+# otherwise-fine decision isn't discarded over a synonym. The agreement metric
+# is direction-based, so getting direction right matters most.
+_DIR_SYNONYMS = {
+    "buy": "long", "long": "long", "bullish": "long",
+    "sell": "short", "short": "short", "bearish": "short",
+    "hold": "no_trade", "none": "no_trade", "flat": "no_trade",
+    "neutral": "no_trade", "wait": "no_trade", "no trade": "no_trade",
+    "no_trade": "no_trade", "skip": "no_trade", "": "no_trade",
+}
+_VALID_STRATEGIES = {
+    "trend_pullback", "breakout_retest", "breakdown_retest",
+    "range_reversal", "momentum_continuation", "no_trade",
+}
+_NUMERIC_FIELDS = (
+    "entry_price", "stop_loss", "take_profit_1", "take_profit_2",
+    "confidence", "risk_reward", "position_size",
+)
+
+
+def _coerce(data: dict[str, Any]) -> None:
+    """Best-effort normalisation of a local model's JSON to our schema."""
+    d = str(data.get("direction", "")).strip().lower()
+    direction = _DIR_SYNONYMS.get(d, d)
+    data["direction"] = direction
+
+    strat = str(data.get("strategy", "")).strip().lower().replace(" ", "_")
+    if strat not in _VALID_STRATEGIES:
+        strat = "no_trade" if direction == "no_trade" else "trend_pullback"
+    data["strategy"] = strat
+
+    et = str(data.get("entry_type", "market")).strip().lower()
+    data["entry_type"] = et if et in ("market", "limit", "stop") else "market"
+
+    for f in _NUMERIC_FIELDS:
+        v = data.get(f)
+        if isinstance(v, str):
+            try:
+                v = float(v.replace(",", "").replace("%", "").strip())
+            except ValueError:
+                v = 0.0
+            data[f] = v
+        elif v is None:
+            data[f] = 0.0
+    # Normalise confidence to 0–100: some models return 0–1 (e.g. 0.7 == 70).
     conf = data.get("confidence")
     if isinstance(conf, (int, float)) and 0 < conf <= 1:
         data["confidence"] = conf * 100
-    proposal = TradeProposal.model_validate(data)
-    return proposal, latency_ms
 
 
 def ollama_health(base_url: str | None = None, timeout: float = 5.0) -> dict[str, Any]:
