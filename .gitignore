@@ -1,0 +1,31 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Node / Next.js
+node_modules/
+.next/
+*.tsbuildinfo
+out/
+npm-debug.log*
+
+# Databases / logs
+*.sqlite
+*.db
+*.log
+logs/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+.artifacts/
