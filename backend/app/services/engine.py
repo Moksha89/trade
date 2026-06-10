@@ -67,23 +67,29 @@ def _risk_unit_multiplier(provider: MarketDataProvider, instrument: str) -> floa
         return 0.0
 
 
-def _entry_signals(ind, candles, zone_pct: float) -> dict[str, bool]:
+def _entry_signals(ind, candles, zone_pct: float) -> dict:
     """Setup-quality signals from the entry-timeframe indicators and candles.
 
     - at_support / at_resistance: price sits within `zone_pct`% of a swing level.
     - bullish/bearish_confirmation: latest candle direction agrees with MACD
       momentum (no buying into bearish momentum / shorting into bullish).
+    - support_room_atr: how many ATRs of room sit below price down to the nearest
+      support (0 if price is at/under support). Lets a breakdown short distinguish
+      "falling toward support with room to run" from "sitting right on the floor".
     """
     price = float(ind.price)
     zone = zone_pct / 100.0
     at_support = price > 0 and abs(price - ind.support) / price <= zone
     at_resistance = price > 0 and abs(ind.resistance - price) / price <= zone
+    atr = float(ind.atr)
+    support_room_atr = (price - float(ind.support)) / atr if atr > 0 and price > ind.support else 0.0
     last = candles[-1]
     green = last.close > last.open
     red = last.close < last.open
     return {
         "at_support": bool(at_support),
         "at_resistance": bool(at_resistance),
+        "support_room_atr": float(support_room_atr),
         "bullish_confirmation": bool(green and ind.macd_hist > 0),
         "bearish_confirmation": bool(red and ind.macd_hist < 0),
     }
@@ -326,6 +332,7 @@ def run_scan(db: Session) -> list[TradeIdea]:
             htf_trends=htf_trends,
             at_support=signals["at_support"],
             at_resistance=signals["at_resistance"],
+            support_room_atr=signals["support_room_atr"],
             bullish_confirmation=signals["bullish_confirmation"],
             bearish_confirmation=signals["bearish_confirmation"],
             volatility_pct=float(ind.volatility_pct),
@@ -644,16 +651,22 @@ def _mark_to_market(trade: Trade, price: float) -> None:
         trade.unrealized_pl = round(trade.size * (trade.entry_price - price) * mult, 2)
 
 
-def close_trade(db: Session, trade: Trade, price: float, reason: str) -> None:
+def close_trade(db: Session, trade: Trade, price: float, reason: str) -> bool:
     # Send the real close first so we can book P/L at the actual fill and alert
     # if the broker rejects it (e.g. the position was already closed).
     executor = get_executor()
     res = executor.close(trade.deal_id, price)
-    fill = res.fill_price if (res and res.ok and res.fill_price) else price
     if res and not res.ok:
+        # The broker did NOT close the position. Do not mark it closed in the DB:
+        # that would leave a live, unmanaged position off-book and double-count its
+        # P/L when the reconcile loop re-adopts it. Keep it open so the next manage
+        # cycle retries the close (or _reconcile_closed_on_broker books it if the
+        # position genuinely disappeared at the broker).
         log_event(db, "close_failed", {"trade_id": trade.id, "error": res.error},
                   instrument=trade.instrument)
-        notify(f"⚠️ {trade.instrument} close may have failed: {res.error}")
+        notify(f"⚠️ {trade.instrument} close FAILED, still open: {res.error}")
+        return False
+    fill = res.fill_price if (res and res.fill_price) else price
     mult = _ccy_mult(trade)
     if trade.direction == "long":
         pl = trade.size * (fill - trade.entry_price) * mult
@@ -672,6 +685,7 @@ def close_trade(db: Session, trade: Trade, price: float, reason: str) -> None:
         instrument=trade.instrument,
     )
     notify(f"🔚 Closed {trade.instrument} ({reason}) | P/L {trade.realized_pl:+.2f}")
+    return True
 
 
 def _partial_close(db: Session, trade: Trade, price: float, pct: float) -> None:
@@ -837,6 +851,114 @@ def _grade_setup(
     return {"verdict": "caution", "summary": f"Caution — {joined}.", "reasons": reasons}
 
 
+def _enforce_stop_risk_cap(
+    db: Session, provider: MarketDataProvider, executor, trade: Trade, risk: dict[str, Any],
+) -> None:
+    """Hard-cap a trade's risk at max_risk_per_trade by tightening an over-risk
+    stop to the cap distance. Only acts on a stop sitting on the LOSING side
+    (long stop below entry / short stop above entry); a stop already trailed
+    into profit is left to the trailing manager. Safe to call every cycle."""
+    if not bool(risk.get("enforce_risk_cap", True)):
+        return
+    entry = trade.entry_price
+    is_long = trade.direction == "long"
+    has_sl = bool(trade.stop_loss) and trade.stop_loss > 0 and abs(trade.stop_loss - entry) > 1e-9
+    on_risk_side = (is_long and trade.stop_loss < entry) or (
+        (not is_long) and trade.stop_loss > entry
+    )
+    if not (has_sl and on_risk_side) or trade.size <= 0:
+        return
+    mult = _risk_unit_multiplier(provider, trade.instrument)
+    if mult <= 0:
+        return
+    cap = float(risk.get("max_risk_per_trade", 50))
+    cur_risk = trade.size * abs(entry - trade.stop_loss) * mult
+    cap_dist = cap / (trade.size * mult)
+    if cur_risk <= cap + 0.5 or cap_dist <= 0:
+        return
+    try:
+        q = provider.get_quote(trade.instrument)
+        cur = q.bid if is_long else q.ask
+    except Exception:  # noqa: BLE001
+        cur = entry
+    # Cap path uses only a tiny price-based buffer (enough to keep the stop off
+    # the live price so the broker accepts it). Unlike the trailing path we do
+    # NOT pad by ATR here: padding would stop us reaching the cap distance on
+    # large positions, leaving risk stuck above the cap. Honouring the cap is
+    # the priority — a slightly tighter stop is the accepted trade-off.
+    buf = abs(cur) * 0.0003
+    if is_long:
+        capped_sl = round(min(entry - cap_dist, cur - buf), 5)
+    else:
+        capped_sl = round(max(entry + cap_dist, cur + buf), 5)
+    tighter = (capped_sl > trade.stop_loss) if is_long else (capped_sl < trade.stop_loss)
+    if not tighter:
+        return
+    res = executor.modify(trade.deal_id, capped_sl, None)
+    if not res.ok:
+        log_event(
+            db, "risk_cap_failed",
+            {"trade_id": trade.id, "intended_sl": capped_sl, "error": res.error},
+            instrument=trade.instrument,
+        )
+        return
+    old_sl, old_risk = trade.stop_loss, round(cur_risk, 2)
+    trade.stop_loss = capped_sl
+    trade.initial_risk_per_unit = abs(entry - capped_sl)
+    trade.initial_risk_aed = round(trade.size * abs(entry - capped_sl) * mult, 2)
+    trade.last_sltp_update = _utcnow()
+    log_event(
+        db, "risk_capped",
+        {"trade_id": trade.id, "strategy": trade.strategy, "old_sl": old_sl,
+         "new_sl": capped_sl, "old_risk_aed": old_risk, "cap": cap,
+         "new_risk_aed": trade.initial_risk_aed},
+        instrument=trade.instrument,
+    )
+    notify(
+        f"🧷 {trade.instrument} {trade.direction.upper()}: stop risked {old_risk} AED "
+        f"(over {cap} cap) — tightened to risk ≤ {trade.initial_risk_aed} AED"
+    )
+
+
+def _apply_bot_trailing_and_cap(
+    db: Session, provider: MarketDataProvider, executor, trade: Trade, risk: dict[str, Any],
+) -> None:
+    """Make a bot trade behave like a manual one for exits: trailing stop with no
+    fixed take-profit ceiling, plus the hard risk cap. Clearing the broker TP
+    once lets the position ride the move; the main manage loop then trails the
+    stop. Gated by bot_trailing_tp (default on)."""
+    plan = dict(trade.management_plan or {})
+    if bool(risk.get("bot_trailing_tp", True)):
+        plan["trail_start_R"] = float(risk.get("bot_trail_start_R", 1.0))
+        # Remove any fixed broker target once so the trailing stop is the exit.
+        if not plan.get("bot_tp_cleared"):
+            has_tp = (trade.take_profit_1 or 0) > 0 or (trade.take_profit_2 or 0) > 0
+            if has_tp:
+                res = executor.clear_take_profit(trade.deal_id)
+                if res.ok:
+                    old_tp = trade.take_profit_1 or trade.take_profit_2
+                    trade.take_profit_1 = 0.0
+                    trade.take_profit_2 = 0.0
+                    plan["bot_tp_cleared"] = True
+                    log_event(
+                        db, "bot_tp_cleared",
+                        {"trade_id": trade.id, "old_tp": old_tp}, instrument=trade.instrument,
+                    )
+                    notify(
+                        f"🎯 {trade.instrument} {trade.direction.upper()}: removed fixed TP "
+                        f"— now trailing so profit can ride the move"
+                    )
+                else:
+                    log_event(
+                        db, "bot_tp_clear_failed",
+                        {"trade_id": trade.id, "error": res.error}, instrument=trade.instrument,
+                    )
+            else:
+                plan["bot_tp_cleared"] = True
+        trade.management_plan = plan
+    _enforce_stop_risk_cap(db, provider, executor, trade, risk)
+
+
 def _protect_and_grade_manual(
     db: Session, provider: MarketDataProvider, executor, trade: Trade,
     risk: dict[str, Any], live: bool,
@@ -868,11 +990,22 @@ def _protect_and_grade_manual(
     entry = trade.entry_price
     is_long = trade.direction == "long"
 
+    # Manual trades use a TRAILING exit by default: a protective stop is set,
+    # then the stop ratchets behind the market (breakeven → lock → ATR trail) so
+    # the winner runs as long as the move lasts and only closes on a real
+    # pullback — no fixed take-profit ceiling that would cash it out early.
+    trailing_tp = bool(risk.get("manual_trailing_tp", True))
+    manual_trail_R = float(risk.get("manual_trail_start_R", 1.0))
+    if trailing_tp:
+        plan["trail_start_R"] = manual_trail_R  # engage the ATR trail once in profit
+
     # 1. Attach a protective SL/TP if the manual trade is missing either (once).
     #    Only in live/demo — paper has no real broker position to modify.
     if live and not plan.get("manual_protected"):
         has_sl = bool(trade.stop_loss) and trade.stop_loss > 0 and abs(trade.stop_loss - entry) > 1e-9
-        has_tp = bool(trade.take_profit_1) and trade.take_profit_1 > 0
+        # With a trailing exit there is no fixed target, so treat the TP as
+        # "already handled" and never attach one — the trailing stop is the exit.
+        has_tp = trailing_tp or (bool(trade.take_profit_1) and trade.take_profit_1 > 0)
         atr = float(ind.atr or 0.0)
         rr = float(risk.get("min_risk_reward", 2.0))
         mult = _risk_unit_multiplier(provider, trade.instrument)
@@ -957,11 +1090,48 @@ def _protect_and_grade_manual(
                      "tp": trade.take_profit_1 if tp_ok else None, "rpu": rpu},
                     instrument=trade.instrument,
                 )
+                exit_desc = (
+                    "trailing stop (no fixed TP)" if trailing_tp
+                    else f"TP {trade.take_profit_1}"
+                )
                 notify(
                     f"🛡️ Protected your manual {trade.instrument} {trade.direction.upper()}: "
-                    f"SL {trade.stop_loss} / TP {trade.take_profit_1} "
+                    f"SL {trade.stop_loss} / {exit_desc} "
                     f"(risk ≤ {trade.initial_risk_aed} AED)"
                 )
+
+    # 1a. Enforce the per-trade risk cap on the stop — even a stop the user set
+    #     by hand. Shared with bot trades; safe to call every cycle.
+    if live:
+        _enforce_stop_risk_cap(db, provider, executor, trade, risk)
+
+    # 1b. Trailing exit: if a manual trade still carries a fixed broker TP (set
+    #     before trailing was enabled, or attached manually), remove it once so
+    #     the trailing stop is the sole exit and the winner isn't capped early.
+    if live and trailing_tp and not plan.get("manual_tp_cleared"):
+        if bool(trade.take_profit_1) and trade.take_profit_1 > 0:
+            res = executor.clear_take_profit(trade.deal_id)
+            if res.ok:
+                old_tp = trade.take_profit_1
+                trade.take_profit_1 = 0.0
+                trade.take_profit_2 = 0.0
+                plan["manual_tp_cleared"] = True
+                log_event(
+                    db, "manual_tp_cleared",
+                    {"trade_id": trade.id, "deal_id": trade.deal_id, "old_tp": old_tp},
+                    instrument=trade.instrument,
+                )
+                notify(
+                    f"🎯 {trade.instrument} {trade.direction.upper()}: removed fixed TP "
+                    f"{old_tp} — now running on a trailing stop so profit can ride the move"
+                )
+            else:
+                log_event(
+                    db, "manual_tp_clear_failed",
+                    {"trade_id": trade.id, "error": res.error}, instrument=trade.instrument,
+                )
+        else:
+            plan["manual_tp_cleared"] = True  # nothing to clear; record so we skip next cycle
 
     # 2. Grade the setup (refreshed each cycle) and surface it on the dashboard.
     grade = _grade_setup(trade.direction, signals, htf_trends)
@@ -1024,6 +1194,10 @@ def manage_open_trades(db: Session) -> None:
         # plan and grade isn't meaningful for them).
         if trade.strategy == "manual" and manage_risk.get("manage_manual_trades", True):
             _protect_and_grade_manual(db, provider, executor, trade, manage_risk, live)
+        # Bot trades: same trailing exit (no fixed TP) + hard risk cap, so every
+        # position rides the move with a capped downside. Toggle bot_trailing_tp.
+        elif live and trade.strategy != "manual":
+            _apply_bot_trailing_and_cap(db, provider, executor, trade, manage_risk)
 
         try:
             quote = provider.get_quote(trade.instrument)

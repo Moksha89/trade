@@ -57,6 +57,7 @@ class CapitalClient:
         self._client = httpx.Client(base_url=self.base_url, timeout=20.0)
         self._account_ccy: str | None = None
         self._meta_cache: dict[str, tuple[str, float]] = {}
+        self._ccy_usd_cache: dict[str, float] = {}
 
     # ---- session ---------------------------------------------------------
     @property
@@ -156,6 +157,46 @@ class CapitalClient:
             self._meta_cache[epic] = (ccy, lot)
         return self._meta_cache[epic]
 
+    def _live_ccy_to_usd(self, ccy: str) -> float | None:
+        """USD value of 1 unit of `ccy`, read live from an FX market.
+
+        Used for quote currencies the static peg table doesn't cover (e.g. JPY
+        for J225, EUR for DE40). Tries the direct CCYUSD market then USDCCY
+        (inverted). Cached for the session."""
+        c = (ccy or "").upper()
+        if not c:
+            return None
+        if c == "USD":
+            return 1.0
+        if c in self._ccy_usd_cache:
+            return self._ccy_usd_cache[c]
+        for sym, invert in ((f"{c}USD", False), (f"USD{c}", True)):
+            try:
+                q = self.get_quote(sym)
+            except Exception:  # noqa: BLE001
+                continue
+            mid = (q.bid + q.ask) / 2.0
+            if mid > 0:
+                rate = (1.0 / mid) if invert else mid
+                self._ccy_usd_cache[c] = rate
+                return rate
+        return None
+
+    def _quote_ccy_to_account(self, quote_ccy: str) -> float | None:
+        """AED value of 1 unit of `quote_ccy`: static peg first, else a live USD
+        cross (quote→USD × USD→account). Returns None if it can't be resolved."""
+        from app.services.fx import quote_to_account
+
+        acct = self.account_currency()
+        fx = quote_to_account(quote_ccy, acct)
+        if fx is not None:
+            return fx
+        usd_to_acct = quote_to_account("USD", acct)
+        quote_to_usd = self._live_ccy_to_usd(quote_ccy)
+        if usd_to_acct is None or quote_to_usd is None:
+            return None
+        return quote_to_usd * usd_to_acct
+
     def risk_unit_multiplier(self, instrument: str) -> float:
         """Account-currency value of a 1-point move for a size-1 position.
 
@@ -164,13 +205,11 @@ class CapitalClient:
         multiplier as "cannot size" and skip the trade, so a wrongly-sized order
         in an unsupported currency can never be placed.
         """
-        from app.services.fx import quote_to_account
-
         try:
             quote_ccy, lot = self.instrument_meta(instrument)
-            fx = quote_to_account(quote_ccy, self.account_currency())
         except CapitalError:
             return 0.0
+        fx = self._quote_ccy_to_account(quote_ccy)
         if fx is None:
             return 0.0
         return fx * lot
@@ -279,6 +318,16 @@ class CapitalClient:
         resp = self._request("PUT", f"/api/v1/positions/{deal_id}", json=payload)
         if resp.status_code != 200:
             raise CapitalError(f"modify failed: {resp.status_code} {resp.text}")
+        return resp.json()
+
+    def clear_take_profit(self, deal_id: str) -> dict[str, Any]:
+        """Remove the server-side take-profit from a position (set profitLevel
+        to null) so the trade can run on a trailing stop with no fixed ceiling."""
+        resp = self._request(
+            "PUT", f"/api/v1/positions/{deal_id}", json={"profitLevel": None}
+        )
+        if resp.status_code != 200:
+            raise CapitalError(f"clear TP failed: {resp.status_code} {resp.text}")
         return resp.json()
 
     def close_position(self, deal_id: str) -> dict[str, Any]:

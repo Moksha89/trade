@@ -153,8 +153,10 @@ def close_trade(trade_id: int, db: Session = Depends(get_db)) -> dict:
         price = get_provider().get_quote(trade.instrument).mid
     except Exception:  # noqa: BLE001
         price = trade.current_price or trade.entry_price
-    engine.close_trade(db, trade, price, "manual_close")
+    ok = engine.close_trade(db, trade, price, "manual_close")
     db.commit()
+    if not ok:
+        raise HTTPException(502, "broker rejected the close; trade is still open")
     return {"trade": trade_to_dict(trade)}
 
 

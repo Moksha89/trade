@@ -50,6 +50,11 @@ def default_risk() -> dict[str, Any]:
         "require_htf_bias": True,  # trade must be WITH a higher-tf trend
         "require_location_filter": True,  # buy at support / sell at resistance
         "support_zone_pct": 0.75,  # how near a level counts as "at" it
+        # Breakdown exception (shorts only): allow a short at support when the
+        # higher-tf trend is down and there is room below — captures the bearish
+        # continuation instead of blocking every short at a level.
+        "allow_short_at_support_in_downtrend": True,
+        "min_support_room_atr": 0.25,  # min ATRs of room below to qualify
         "require_confirmation": True,  # confirmation candle + momentum
         "min_reward_atr": 1.0,  # anti-scalp: target ≥ N×ATR away
         "min_volatility_pct": 0.03,  # skip dead markets
@@ -58,6 +63,20 @@ def default_risk() -> dict[str, Any]:
         # if missing and grade the setup. manual_stop_atr_mult sizes that stop.
         "manage_manual_trades": True,
         "manual_stop_atr_mult": 1.5,
+        # Trailing exit for manual trades: no fixed take-profit ceiling — the
+        # stop ratchets behind the market so winners run until a real pullback.
+        # manual_trail_start_R is the profit (in R) at which the ATR trail kicks
+        # in (breakeven/lock already protect before that).
+        "manual_trailing_tp": True,
+        "manual_trail_start_R": 1.0,
+        # Trailing exit for the bot's OWN trades too: clear the fixed broker TP
+        # so the position rides the move and exits on the trailing stop.
+        "bot_trailing_tp": True,
+        "bot_trail_start_R": 1.0,
+        # Hard-cap per-trade risk at max_risk_per_trade for every trade (manual
+        # or bot) even on a stop placed by hand: tighten an over-risk stop to the
+        # cap distance. A stop already trailed into profit is left untouched.
+        "enforce_risk_cap": True,
         "hedging_enabled": env.hedging_enabled,
         "news_filter_enabled": True,
         "market_hours_filter_enabled": True,

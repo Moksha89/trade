@@ -326,3 +326,54 @@ def test_setup_filters_toggle_off():
     # Bare ctx (no support/confirmation signals) is approved when filters are off.
     d = evaluate_proposal(_long(), _ctx(), risk, STRAT)
     assert d.approved, d.reason
+
+
+# --- Breakdown exception: short at support in a confirmed downtrend ---
+
+def _breakdown_short_ctx(**kw):
+    """Short sitting AT support (not at resistance) in a down trend."""
+    base = dict(
+        account_capital=5000.0,
+        at_support=True,
+        at_resistance=False,
+        bearish_confirmation=True,
+        support_room_atr=0.5,
+        htf_trends={"1H": "down", "4H": "down"},
+    )
+    base.update(kw)
+    return RiskContext(**base)
+
+
+def test_short_at_support_allowed_in_downtrend_with_room():
+    # Down trend + room below to support -> breakdown short is allowed at support.
+    d = evaluate_proposal(_short(), _breakdown_short_ctx(), STRICT, STRAT)
+    assert d.approved, d.reason
+
+
+def test_short_at_support_blocked_without_room():
+    # Sitting right on the level (no ATR room) -> still rejected as into support.
+    d = evaluate_proposal(_short(), _breakdown_short_ctx(support_room_atr=0.1), STRICT, STRAT)
+    assert not d.approved and "into support" in d.reason
+
+
+def test_short_at_support_blocked_when_not_downtrend():
+    # No higher-tf downtrend -> exception does not apply -> rejected.
+    risk = {**STRICT, "require_htf_bias": False}
+    d = evaluate_proposal(
+        _short(),
+        _breakdown_short_ctx(htf_trends={"1H": "sideways", "4H": "sideways"}),
+        risk, STRAT,
+    )
+    assert not d.approved and "into support" in d.reason
+
+
+def test_short_at_support_blocked_when_exception_toggled_off():
+    risk = {**STRICT, "allow_short_at_support_in_downtrend": False}
+    d = evaluate_proposal(_short(), _breakdown_short_ctx(), risk, STRAT)
+    assert not d.approved and "into support" in d.reason
+
+
+def test_long_into_resistance_still_strict():
+    # The breakdown exception is shorts-only; longs into resistance stay blocked.
+    d = evaluate_proposal(_long(), _good_long_ctx(at_resistance=True, at_support=True), STRICT, STRAT)
+    assert not d.approved and "into resistance" in d.reason

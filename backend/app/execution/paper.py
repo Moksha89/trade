@@ -32,5 +32,8 @@ class PaperExecutor:
     ) -> ExecutionResult:
         return ExecutionResult(ok=True, deal_id=deal_id)
 
+    def clear_take_profit(self, deal_id: str | None) -> ExecutionResult:
+        return ExecutionResult(ok=True, deal_id=deal_id)
+
     def close(self, deal_id: str | None, price: float) -> ExecutionResult:
         return ExecutionResult(ok=True, fill_price=price, deal_id=deal_id)

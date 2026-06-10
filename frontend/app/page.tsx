@@ -22,7 +22,10 @@ export default function DashboardPage() {
 
   const refresh = useCallback(() => {
     getDashboardStatus()
-      .then(setStatus)
+      .then((s) => {
+        setStatus(s);
+        setError(null); // a good poll clears any stale transient-error banner
+      })
       .catch((e) => setError(e.message));
   }, []);
 
