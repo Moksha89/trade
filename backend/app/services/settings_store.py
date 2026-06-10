@@ -94,6 +94,11 @@ def default_ai() -> dict[str, Any]:
         "auto_mode": False,
         # Feed our realized track record back into the AI prompt.
         "performance_memory_enabled": True,
+        # Shadow pilot: run a local model (Ollama) on the SAME payload as Claude
+        # and record both decisions for comparison. The shadow model never trades.
+        "shadow_compare_enabled": False,
+        "shadow_model": env.ollama_model,
+        "shadow_max_per_scan": 14,
     }
 
 

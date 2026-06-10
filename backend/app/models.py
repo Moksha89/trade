@@ -133,3 +133,46 @@ class AuditLog(Base):
     event: Mapped[str] = mapped_column(String(48))
     instrument: Mapped[str | None] = mapped_column(String(32), nullable=True)
     detail: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ShadowDecision(Base):
+    """A side-by-side record of Claude's live decision vs the local (Ollama)
+    model's shadow decision on the SAME market payload.
+
+    The shadow model never trades — these rows exist purely to compare the two
+    on identical inputs so we can decide, with evidence, whether the free local
+    model is good enough to replace the paid API.
+    """
+
+    __tablename__ = "shadow_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    instrument: Mapped[str] = mapped_column(String(32))
+    prompt_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    market_classification: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # Live (Claude) decision
+    claude_direction: Mapped[str] = mapped_column(String(16), default="no_trade")
+    claude_strategy: Mapped[str] = mapped_column(String(48), default="no_trade")
+    claude_confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    claude_risk_reward: Mapped[float] = mapped_column(Float, default=0.0)
+    claude_entry: Mapped[float] = mapped_column(Float, default=0.0)
+    claude_stop_loss: Mapped[float] = mapped_column(Float, default=0.0)
+    claude_take_profit_1: Mapped[float] = mapped_column(Float, default=0.0)
+    claude_latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Shadow (Ollama / local) decision
+    ollama_model: Mapped[str] = mapped_column(String(64), default="")
+    ollama_direction: Mapped[str] = mapped_column(String(16), default="no_trade")
+    ollama_strategy: Mapped[str] = mapped_column(String(48), default="no_trade")
+    ollama_confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    ollama_risk_reward: Mapped[float] = mapped_column(Float, default=0.0)
+    ollama_entry: Mapped[float] = mapped_column(Float, default=0.0)
+    ollama_stop_loss: Mapped[float] = mapped_column(Float, default=0.0)
+    ollama_take_profit_1: Mapped[float] = mapped_column(Float, default=0.0)
+    ollama_latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    ollama_error: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # Did both models agree on the direction (long/short/no_trade)?
+    agree: Mapped[bool] = mapped_column(Boolean, default=False)

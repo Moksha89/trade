@@ -18,7 +18,7 @@ from app.api.serializers import (
 )
 from app.config import settings
 from app.db import get_db
-from app.models import AuditLog, JournalSnapshot, Trade, TradeIdea
+from app.models import AuditLog, JournalSnapshot, ShadowDecision, Trade, TradeIdea
 from app.services import accounts, emergency, engine
 from app.services.audit import log_event
 from app.services.live_pricing import live_mark
@@ -234,6 +234,90 @@ def list_logs(limit: int = 200, event: str | None = None, db: Session = Depends(
     if event:
         stmt = select(AuditLog).where(AuditLog.event == event).order_by(desc(AuditLog.id)).limit(limit)
     return [audit_to_dict(a) for a in db.scalars(stmt)]
+
+
+# ---- AI shadow comparison (Claude vs local Ollama) -----------------------
+def _shadow_to_dict(r: ShadowDecision) -> dict:
+    return {
+        "id": r.id,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "instrument": r.instrument,
+        "market_classification": r.market_classification,
+        "agree": r.agree,
+        "claude": {
+            "direction": r.claude_direction,
+            "strategy": r.claude_strategy,
+            "confidence": r.claude_confidence,
+            "risk_reward": r.claude_risk_reward,
+            "entry": r.claude_entry,
+            "stop_loss": r.claude_stop_loss,
+            "take_profit_1": r.claude_take_profit_1,
+            "latency_ms": r.claude_latency_ms,
+        },
+        "ollama": {
+            "model": r.ollama_model,
+            "direction": r.ollama_direction,
+            "strategy": r.ollama_strategy,
+            "confidence": r.ollama_confidence,
+            "risk_reward": r.ollama_risk_reward,
+            "entry": r.ollama_entry,
+            "stop_loss": r.ollama_stop_loss,
+            "take_profit_1": r.ollama_take_profit_1,
+            "latency_ms": r.ollama_latency_ms,
+            "error": r.ollama_error,
+        },
+    }
+
+
+@router.get("/ai-comparison")
+def ai_comparison(limit: int = 100, db: Session = Depends(get_db)) -> dict:
+    """Side-by-side Claude vs local-model (Ollama) decisions + rollup metrics."""
+    from app.ai.ollama_engine import ollama_health
+
+    rows = list(
+        db.scalars(select(ShadowDecision).order_by(desc(ShadowDecision.id)).limit(limit))
+    )
+    total = len(rows)
+    ok = [r for r in rows if not r.ollama_error]
+    errors = total - len(ok)
+    agree = sum(1 for r in ok if r.agree)
+
+    def _is_trade(d: str) -> bool:
+        return d in ("long", "short")
+
+    both_trade = sum(1 for r in ok if _is_trade(r.claude_direction) and _is_trade(r.ollama_direction))
+    both_no_trade = sum(
+        1 for r in ok if not _is_trade(r.claude_direction) and not _is_trade(r.ollama_direction)
+    )
+    claude_only = sum(1 for r in ok if _is_trade(r.claude_direction) and not _is_trade(r.ollama_direction))
+    ollama_only = sum(1 for r in ok if not _is_trade(r.claude_direction) and _is_trade(r.ollama_direction))
+
+    def _avg(vals: list[float]) -> float:
+        return round(sum(vals) / len(vals), 1) if vals else 0.0
+
+    summary = {
+        "total": total,
+        "comparable": len(ok),
+        "errors": errors,
+        "agree": agree,
+        "agreement_rate": round(100 * agree / len(ok), 1) if ok else 0.0,
+        "both_trade": both_trade,
+        "both_no_trade": both_no_trade,
+        "claude_trade_only": claude_only,
+        "ollama_trade_only": ollama_only,
+        "avg_claude_latency_ms": _avg([r.claude_latency_ms for r in ok]),
+        "avg_ollama_latency_ms": _avg([r.ollama_latency_ms for r in ok]),
+        "avg_claude_confidence": _avg([r.claude_confidence for r in ok if _is_trade(r.claude_direction)]),
+        "avg_ollama_confidence": _avg([r.ollama_confidence for r in ok if _is_trade(r.ollama_direction)]),
+    }
+    ai_cfg = get_group(db, AI)
+    return {
+        "summary": summary,
+        "recent": [_shadow_to_dict(r) for r in rows],
+        "enabled": bool(ai_cfg.get("shadow_compare_enabled", False)),
+        "shadow_model": ai_cfg.get("shadow_model", settings.ollama_model),
+        "ollama": ollama_health(),
+    }
 
 
 # ---- backtest ------------------------------------------------------------

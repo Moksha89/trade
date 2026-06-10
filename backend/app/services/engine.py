@@ -11,6 +11,7 @@ live execution is used automatically when Capital.com credentials are present.
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
@@ -24,7 +25,7 @@ from app.execution.factory import get_executor
 from app.indicators.engine import compute_indicators
 from app.market_data.base import MarketDataProvider
 from app.market_data.factory import get_provider
-from app.models import Trade, TradeIdea
+from app.models import ShadowDecision, Trade, TradeIdea
 from app.risk.engine import RiskContext, evaluate_proposal
 from app.services import accounts
 from app.services.audit import log_event
@@ -106,6 +107,58 @@ def _higher_timeframe_trends(
     return trends
 
 
+def _record_shadow(
+    db: Session,
+    instrument: str,
+    payload: dict,
+    phash: str,
+    classification: str,
+    claude_proposal: TradeProposal,
+    claude_latency_ms: int,
+    shadow_model: str | None,
+) -> None:
+    """Run the local (Ollama) model on the same payload and store both decisions.
+
+    Shadow-only: this never influences the live trade. Any failure is recorded
+    on the row (ollama_error) and otherwise swallowed so the scan is unaffected.
+    """
+    from app.ai.ollama_engine import propose_trade_ollama
+
+    row = ShadowDecision(
+        instrument=instrument,
+        prompt_hash=phash,
+        market_classification=classification,
+        claude_direction=claude_proposal.direction.value,
+        claude_strategy=claude_proposal.strategy.value,
+        claude_confidence=float(claude_proposal.confidence),
+        claude_risk_reward=float(claude_proposal.risk_reward),
+        claude_entry=float(claude_proposal.entry_price or 0.0),
+        claude_stop_loss=float(claude_proposal.stop_loss or 0.0),
+        claude_take_profit_1=float(claude_proposal.take_profit_1 or 0.0),
+        claude_latency_ms=claude_latency_ms,
+        ollama_model=shadow_model or settings.ollama_model,
+    )
+    try:
+        prop, latency_ms = propose_trade_ollama(payload, model=shadow_model)
+        row.ollama_direction = prop.direction.value
+        row.ollama_strategy = prop.strategy.value
+        row.ollama_confidence = float(prop.confidence)
+        row.ollama_risk_reward = float(prop.risk_reward)
+        row.ollama_entry = float(prop.entry_price or 0.0)
+        row.ollama_stop_loss = float(prop.stop_loss or 0.0)
+        row.ollama_take_profit_1 = float(prop.take_profit_1 or 0.0)
+        row.ollama_latency_ms = latency_ms
+        row.agree = row.ollama_direction == row.claude_direction
+    except Exception as exc:  # noqa: BLE001 — shadow must never break the scan
+        row.ollama_error = str(exc)[:255]
+        row.agree = False
+    try:
+        db.add(row)
+        db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
+
+
 # --------------------------------------------------------------------------
 # Scan & propose (every 5 minutes)
 # --------------------------------------------------------------------------
@@ -130,6 +183,7 @@ def run_scan(db: Session) -> list[TradeIdea]:
 
     acct_stats = accounts.stats(db)
     open_risk = accounts.current_open_risk(db)
+    shadow_done = 0
 
     for instrument in risk.get("allowed_instruments", []):
         if any(t.instrument == instrument for t in open_now):
@@ -169,6 +223,7 @@ def run_scan(db: Session) -> list[TradeIdea]:
             if ai_cfg.get("performance_memory_enabled", True)
             else {}
         )
+        _t0 = time.time()
         proposal, payload, phash = propose_trade(
             instrument,
             ind,
@@ -184,8 +239,19 @@ def run_scan(db: Session) -> list[TradeIdea]:
             },
             model=ai_cfg.get("model"),
         )
+        claude_latency_ms = int((time.time() - _t0) * 1000)
         # The AI must analyse the scanned instrument; never trust an echoed value.
         proposal.instrument = instrument
+        # Shadow pilot: run the local model on the same payload and record both
+        # decisions side by side. Never affects the live decision below.
+        if ai_cfg.get("shadow_compare_enabled", False) and shadow_done < int(
+            ai_cfg.get("shadow_max_per_scan", 14)
+        ):
+            shadow_done += 1
+            _record_shadow(
+                db, instrument, payload, phash, condition.value,
+                proposal, claude_latency_ms, ai_cfg.get("shadow_model"),
+            )
         log_event(
             db,
             "ai_response",

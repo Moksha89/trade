@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     ai_min_confidence: int = 70
 
+    # Local model (Ollama) — used for shadow comparison against Claude. The
+    # containers reach the host's Ollama via the Docker bridge gateway.
+    ollama_base_url: str = "http://172.18.0.1:11434"
+    ollama_model: str = "qwen2.5:7b-instruct"
+    ollama_timeout_seconds: float = 120.0
+
     # Risk engine defaults (AED). These seed the DB-backed risk settings on first run.
     account_start_capital: float = 5000
     max_active_trades: int = 2
