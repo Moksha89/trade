@@ -181,3 +181,52 @@ export const runBacktest = (instrument: string, bars = 600) =>
 export const emergency = (action: string) => apiPost(`/api/emergency/${action}`);
 export const brokerStatus = () => apiGet<Record<string, unknown>>("/api/broker/status");
 export const brokerReconnect = () => apiPost("/api/broker/reconnect");
+
+// ---- AI shadow comparison (Claude vs local Ollama) ----
+export interface ShadowSide {
+  direction: string;
+  strategy: string;
+  confidence: number;
+  risk_reward: number;
+  entry: number;
+  stop_loss: number;
+  take_profit_1: number;
+  latency_ms: number;
+  model?: string;
+  error?: string | null;
+}
+export interface ShadowRow {
+  id: number;
+  created_at: string | null;
+  instrument: string;
+  market_classification: string | null;
+  agree: boolean;
+  claude: ShadowSide;
+  ollama: ShadowSide;
+}
+export interface ShadowSummary {
+  total: number;
+  comparable: number;
+  errors: number;
+  agree: number;
+  agreement_rate: number;
+  both_trade: number;
+  both_no_trade: number;
+  claude_trade_only: number;
+  ollama_trade_only: number;
+  avg_claude_latency_ms: number;
+  avg_ollama_latency_ms: number;
+  avg_claude_confidence: number;
+  avg_ollama_confidence: number;
+}
+export interface AIComparison {
+  summary: ShadowSummary;
+  recent: ShadowRow[];
+  enabled: boolean;
+  shadow_model: string;
+  ollama: { reachable: boolean; version?: string; error?: string };
+}
+export const getAIComparison = (limit = 100) =>
+  apiGet<AIComparison>(`/api/ai-comparison?limit=${limit}`);
+export const setShadowEnabled = (enabled: boolean) =>
+  putSettings("ai", { shadow_compare_enabled: enabled });

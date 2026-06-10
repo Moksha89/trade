@@ -82,6 +82,11 @@ def propose_trade_ollama(
     data = json.loads(text)
     # Echo the correct instrument in case the model copied the schema example.
     data["instrument"] = payload.get("instrument", data.get("instrument", ""))
+    # Normalise confidence to a 0–100 scale: some local models return 0–1
+    # (e.g. 0.7) where Claude returns 70, which would skew the comparison.
+    conf = data.get("confidence")
+    if isinstance(conf, (int, float)) and 0 < conf <= 1:
+        data["confidence"] = conf * 100
     proposal = TradeProposal.model_validate(data)
     return proposal, latency_ms
 

@@ -12,6 +12,7 @@ const NAV = [
   { href: "/risk", label: "Risk Settings" },
   { href: "/strategy", label: "Strategy Settings" },
   { href: "/ai", label: "AI Settings" },
+  { href: "/ai-comparison", label: "AI Comparison" },
   { href: "/broker", label: "Capital.com" },
   { href: "/backtest", label: "Backtest" },
   { href: "/logs", label: "Logs / Audit" },

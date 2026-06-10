@@ -183,7 +183,7 @@ def run_scan(db: Session) -> list[TradeIdea]:
 
     acct_stats = accounts.stats(db)
     open_risk = accounts.current_open_risk(db)
-    shadow_done = 0
+    shadow_queue: list[tuple] = []
 
     for instrument in risk.get("allowed_instruments", []):
         if any(t.instrument == instrument for t in open_now):
@@ -242,15 +242,14 @@ def run_scan(db: Session) -> list[TradeIdea]:
         claude_latency_ms = int((time.time() - _t0) * 1000)
         # The AI must analyse the scanned instrument; never trust an echoed value.
         proposal.instrument = instrument
-        # Shadow pilot: run the local model on the same payload and record both
-        # decisions side by side. Never affects the live decision below.
-        if ai_cfg.get("shadow_compare_enabled", False) and shadow_done < int(
+        # Shadow pilot: queue the same payload for the local model. We run all
+        # shadow calls AFTER the live loop (below) so the slow local inference
+        # never delays a live trade decision.
+        if ai_cfg.get("shadow_compare_enabled", False) and len(shadow_queue) < int(
             ai_cfg.get("shadow_max_per_scan", 14)
         ):
-            shadow_done += 1
-            _record_shadow(
-                db, instrument, payload, phash, condition.value,
-                proposal, claude_latency_ms, ai_cfg.get("shadow_model"),
+            shadow_queue.append(
+                (instrument, payload, phash, condition.value, proposal, claude_latency_ms)
             )
         log_event(
             db,
@@ -355,6 +354,14 @@ def run_scan(db: Session) -> list[TradeIdea]:
                 execute_idea(db, idea)
 
     db.commit()
+
+    # Shadow pilot: now that every live decision is recorded, run the local
+    # model on the same payloads and log both side by side. This is the slow
+    # part (CPU inference), deliberately done last so it never delays a trade.
+    shadow_model = ai_cfg.get("shadow_model")
+    for instrument, payload, phash, classification, proposal, c_lat in shadow_queue:
+        _record_shadow(db, instrument, payload, phash, classification, proposal, c_lat, shadow_model)
+
     return created
 
 

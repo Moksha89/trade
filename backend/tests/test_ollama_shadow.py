@@ -55,6 +55,24 @@ def test_forces_correct_instrument(monkeypatch):
     assert prop.instrument == "US100"
 
 
+def test_normalises_0_1_confidence_to_0_100(monkeypatch):
+    raw = json.dumps(
+        {"instrument": "GOLD", "direction": "short", "strategy": "trend_pullback", "confidence": 0.7}
+    )
+    monkeypatch.setattr(ollama_engine, "_post_chat", lambda *a, **k: raw)
+    prop, _ = ollama_engine.propose_trade_ollama(_payload())
+    assert prop.confidence == 70.0
+
+
+def test_leaves_0_100_confidence_unchanged(monkeypatch):
+    raw = json.dumps(
+        {"instrument": "GOLD", "direction": "short", "strategy": "trend_pullback", "confidence": 72}
+    )
+    monkeypatch.setattr(ollama_engine, "_post_chat", lambda *a, **k: raw)
+    prop, _ = ollama_engine.propose_trade_ollama(_payload())
+    assert prop.confidence == 72.0
+
+
 def test_propagates_errors_for_caller_to_swallow(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("connection refused")
