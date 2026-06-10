@@ -20,6 +20,7 @@ def trade_to_dict(t: Trade) -> dict[str, Any]:
             else (t.entry_price - t.current_price)
         )
         r_multiple = round(move / t.initial_risk_per_unit, 2)
+    plan = t.management_plan or {}
     return {
         "id": t.id,
         "idea_id": t.idea_id,
@@ -27,6 +28,9 @@ def trade_to_dict(t: Trade) -> dict[str, Any]:
         "instrument": t.instrument,
         "direction": t.direction,
         "strategy": t.strategy,
+        "grade": plan.get("grade"),
+        "grade_summary": plan.get("grade_summary"),
+        "grade_reasons": plan.get("grade_reasons") or [],
         "entry_price": t.entry_price,
         "current_price": t.current_price,
         "size": t.size,

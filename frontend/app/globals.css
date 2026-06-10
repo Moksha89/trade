@@ -145,6 +145,16 @@ button.danger {
   color: var(--muted);
 }
 
+.pill.warn {
+  color: #e0a52e;
+  border-color: #e0a52e;
+}
+
+.pill.bad {
+  color: var(--red);
+  border-color: var(--red);
+}
+
 /* ---- app shell / nav ---- */
 .layout {
   display: flex;

@@ -51,18 +51,19 @@ export default function TradesPage() {
         <table>
           <thead>
             <tr>
-              <th>Instr</th><th>Dir</th><th>Entry</th><th>Current</th><th>Size</th>
+              <th>Instr</th><th>Dir</th><th>Setup</th><th>Entry</th><th>Current</th><th>Size</th>
               <th>SL</th><th>TP1</th><th>R</th><th>uP/L</th><th>Mgmt</th><th></th>
             </tr>
           </thead>
           <tbody>
             {open.length === 0 && (
-              <tr><td colSpan={11} className="muted">No open trades.</td></tr>
+              <tr><td colSpan={12} className="muted">No open trades.</td></tr>
             )}
             {open.map((t) => (
               <tr key={t.id}>
                 <td>{t.instrument}</td>
                 <td className={t.direction === "long" ? "long" : "short"}>{t.direction}</td>
+                <td>{gradeBadge(t)}</td>
                 <td>{round(t.entry_price)}</td>
                 <td>{round(t.current_price)}</td>
                 <td>{round(t.size, 4)}</td>
@@ -105,6 +106,17 @@ export default function TradesPage() {
         </table>
       </div>
     </Shell>
+  );
+}
+
+function gradeBadge(t: Trade) {
+  if (!t.grade) return <span className="muted">—</span>;
+  const cls: Record<string, string> = { good: "on", caution: "warn", risky: "bad" };
+  const label: Record<string, string> = { good: "GOOD", caution: "CAUTION", risky: "RISKY" };
+  return (
+    <span className={`pill ${cls[t.grade] ?? ""}`} title={t.grade_summary ?? ""}>
+      {label[t.grade] ?? t.grade.toUpperCase()}
+    </span>
   );
 }
 

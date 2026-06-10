@@ -784,9 +784,181 @@ def _adopt_untracked_positions(
     db.commit()
 
 
+def _grade_setup(
+    direction: str, signals: dict[str, bool], htf_trends: dict[str, str]
+) -> dict[str, Any]:
+    """Grade a (manual) trade's setup the same way the live filter judges a NEW
+    entry. Returns {verdict, summary, reasons}; verdict is good|caution|risky.
+
+    Mirrors the risk engine's setup-quality gates (trend alignment, higher-tf
+    bias, support/resistance location, confirmation candle) so a hand-placed
+    trade gets the exact same second opinion the bot applies to its own."""
+    is_long = direction == "long"
+    reasons: list[str] = []
+    serious = False
+
+    opposing = "down" if is_long else "up"
+    favouring = "up" if is_long else "down"
+    against = sorted(tf for tf, tr in htf_trends.items() if tr == opposing)
+    if against:
+        reasons.append(f"counter-trend: fighting the {'/'.join(against)} {opposing}trend")
+        serious = True
+    elif htf_trends and not any(tr == favouring for tr in htf_trends.values()):
+        reasons.append(f"no higher-timeframe {favouring}trend bias (sideways)")
+
+    if is_long:
+        if signals["at_resistance"]:
+            reasons.append("buying into resistance (overhead supply)")
+            serious = True
+        elif not signals["at_support"]:
+            reasons.append("not at support — no clear floor below the entry")
+    else:
+        if signals["at_support"]:
+            reasons.append("shorting into support (buyers tend to defend here)")
+            serious = True
+        elif not signals["at_resistance"]:
+            reasons.append("not at resistance — no clear ceiling above the entry")
+
+    if is_long and not signals["bullish_confirmation"]:
+        reasons.append("no bullish confirmation (candle/momentum not up)")
+    if not is_long and not signals["bearish_confirmation"]:
+        reasons.append("no bearish confirmation (candle/momentum not down)")
+
+    if not reasons:
+        return {
+            "verdict": "good",
+            "summary": "Good setup — with the higher-timeframe trend, sound entry "
+            "location, and momentum confirms.",
+            "reasons": [],
+        }
+    joined = "; ".join(reasons)
+    if serious:
+        return {"verdict": "risky", "summary": f"Risky — {joined}.", "reasons": reasons}
+    return {"verdict": "caution", "summary": f"Caution — {joined}.", "reasons": reasons}
+
+
+def _protect_and_grade_manual(
+    db: Session, provider: MarketDataProvider, executor, trade: Trade,
+    risk: dict[str, Any], live: bool,
+) -> None:
+    """Attach a protective server-side SL/TP to a manually-opened position if it
+    has none, and grade its setup good/caution/risky for the dashboard.
+
+    Protection is applied at most once (recorded in the management plan); the
+    grade is refreshed every cycle so it stays current as the market moves. This
+    NEVER closes the position — the grade is advisory and the user stays in
+    control of exiting. All broker/market errors are caught so a manual trade can
+    never break the manage loop."""
+    try:
+        candles = provider.get_candles(trade.instrument, "5M", 200)
+        ind = compute_indicators(candles)
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            db, "manual_manage_error",
+            {"trade_id": trade.id, "error": str(exc)[:120]}, instrument=trade.instrument,
+        )
+        return
+
+    signals = _entry_signals(ind, candles, float(risk.get("support_zone_pct", 0.75)))
+    htf_trends = _higher_timeframe_trends(
+        provider, trade.instrument, risk.get("trend_alignment_timeframes", ["1H", "4H"])
+    )
+
+    plan = dict(trade.management_plan or {})
+    entry = trade.entry_price
+    is_long = trade.direction == "long"
+
+    # 1. Attach a protective SL/TP if the manual trade is missing either (once).
+    #    Only in live/demo — paper has no real broker position to modify.
+    if live and not plan.get("manual_protected"):
+        has_sl = bool(trade.stop_loss) and trade.stop_loss > 0 and abs(trade.stop_loss - entry) > 1e-9
+        has_tp = bool(trade.take_profit_1) and trade.take_profit_1 > 0
+        atr = float(ind.atr or 0.0)
+        rr = float(risk.get("min_risk_reward", 2.0))
+        mult = _risk_unit_multiplier(provider, trade.instrument)
+        cap = float(risk.get("max_risk_per_trade", 50))
+
+        if has_sl:
+            rpu = abs(entry - trade.stop_loss)
+        else:
+            rpu = atr * float(risk.get("manual_stop_atr_mult", 1.5))
+            # Keep risk within the per-trade cap: tighten the stop if the manual
+            # size would otherwise risk more than the cap allows.
+            if mult > 0 and trade.size > 0:
+                cap_dist = cap / (trade.size * mult)
+                if cap_dist > 0:
+                    rpu = min(rpu, cap_dist)
+
+        new_sl = None
+        new_tp = None
+        if not has_sl and rpu > 0:
+            new_sl = round(entry - rpu, 5) if is_long else round(entry + rpu, 5)
+        if not has_tp and rpu > 0:
+            new_tp = round(entry + rpu * rr, 5) if is_long else round(entry - rpu * rr, 5)
+
+        if new_sl is not None or new_tp is not None:
+            res = executor.modify(trade.deal_id, new_sl, new_tp)
+            if res.ok:
+                if new_sl is not None:
+                    trade.stop_loss = new_sl
+                if new_tp is not None:
+                    trade.take_profit_1 = new_tp
+                trade.initial_risk_per_unit = rpu
+                if mult > 0:
+                    trade.initial_risk_aed = round(trade.size * rpu * mult, 2)
+                trade.last_sltp_update = _utcnow()
+                plan["manual_protected"] = True
+                log_event(
+                    db, "manual_protected",
+                    {"trade_id": trade.id, "deal_id": trade.deal_id,
+                     "sl": new_sl, "tp": new_tp, "rpu": rpu},
+                    instrument=trade.instrument,
+                )
+                notify(
+                    f"🛡️ Protected your manual {trade.instrument} {trade.direction.upper()}: "
+                    f"SL {trade.stop_loss} / TP {trade.take_profit_1} "
+                    f"(risk ≤ {trade.initial_risk_aed} AED)"
+                )
+            else:
+                log_event(
+                    db, "manual_protect_failed",
+                    {"trade_id": trade.id, "intended_sl": new_sl,
+                     "intended_tp": new_tp, "error": res.error},
+                    instrument=trade.instrument,
+                )
+                notify(
+                    f"⚠️ Couldn't set SL/TP on your manual {trade.instrument} "
+                    f"({res.error}) — will retry next cycle"
+                )
+        else:
+            plan["manual_protected"] = True  # user already set both — nothing to do
+
+    # 2. Grade the setup (refreshed each cycle) and surface it on the dashboard.
+    grade = _grade_setup(trade.direction, signals, htf_trends)
+    prev = plan.get("grade")
+    plan["grade"] = grade["verdict"]
+    plan["grade_summary"] = grade["summary"]
+    plan["grade_reasons"] = grade["reasons"]
+    plan["grade_at"] = _utcnow().isoformat()
+    trade.management_plan = plan  # reassign so SQLAlchemy persists the JSON change
+    if prev != grade["verdict"]:
+        log_event(
+            db, "manual_graded",
+            {"trade_id": trade.id, "verdict": grade["verdict"], "reasons": grade["reasons"]},
+            instrument=trade.instrument,
+        )
+        emoji = {"good": "✅", "caution": "⚠️", "risky": "🛑"}.get(grade["verdict"], "•")
+        notify(
+            f"{emoji} Manual {trade.instrument} {trade.direction.upper()} graded "
+            f"{grade['verdict'].upper()}: {grade['summary']}"
+        )
+    db.commit()
+
+
 def manage_open_trades(db: Session) -> None:
     provider = get_provider()
     executor = get_executor()
+    manage_risk = get_group(db, RISK)
     live = executor.mode in ("demo", "live")
 
     # In live/demo, learn which positions the broker still holds so we can
@@ -815,6 +987,13 @@ def manage_open_trades(db: Session) -> None:
             _reconcile_closed_on_broker(db, trade)
             db.commit()
             continue
+
+        # Manually-opened (adopted) trades: attach a protective SL/TP if missing
+        # and grade the setup good/caution/risky for the dashboard. Advisory only
+        # — never closes the position. Bot trades skip this (they're born with a
+        # plan and grade isn't meaningful for them).
+        if trade.strategy == "manual" and manage_risk.get("manage_manual_trades", True):
+            _protect_and_grade_manual(db, provider, executor, trade, manage_risk, live)
 
         try:
             quote = provider.get_quote(trade.instrument)

@@ -115,6 +115,9 @@ export interface Trade {
   instrument: string;
   direction: string;
   strategy: string;
+  grade?: string | null;
+  grade_summary?: string | null;
+  grade_reasons?: string[];
   entry_price: number;
   current_price: number;
   size: number;

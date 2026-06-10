@@ -54,6 +54,10 @@ def default_risk() -> dict[str, Any]:
         "min_reward_atr": 1.0,  # anti-scalp: target ≥ N×ATR away
         "min_volatility_pct": 0.03,  # skip dead markets
         "max_volatility_pct": 8.0,  # skip chaotic markets
+        # Manual trades opened in the broker app: auto-attach a protective SL/TP
+        # if missing and grade the setup. manual_stop_atr_mult sizes that stop.
+        "manage_manual_trades": True,
+        "manual_stop_atr_mult": 1.5,
         "hedging_enabled": env.hedging_enabled,
         "news_filter_enabled": True,
         "market_hours_filter_enabled": True,
