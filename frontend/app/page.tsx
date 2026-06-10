@@ -82,6 +82,8 @@ export default function DashboardPage() {
             <Metric k="Auto mode" v={status.auto_mode_enabled ? "On" : "Off"} on={status.auto_mode_enabled} />
             <Metric k="Hedging" v={status.hedging_enabled ? "On" : "Off"} on={status.hedging_enabled} />
             <Metric k="Account balance" v={fmt(status.account_balance, "AED ")} />
+            <Metric k="Equity (live)" v={fmt(status.account_equity, "AED ")} cls={plCls(status.open_pnl)} />
+            <Metric k="Open P/L" v={fmt(status.open_pnl, "AED ")} cls={plCls(status.open_pnl)} />
             <Metric k="Available funds" v={fmt(status.available_funds, "AED ")} />
             <Metric k="Today P/L" v={fmt(status.today_pl, "AED ")} cls={plCls(status.today_pl)} />
             <Metric k="Weekly P/L" v={fmt(status.weekly_pl, "AED ")} cls={plCls(status.weekly_pl)} />

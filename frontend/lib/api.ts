@@ -71,6 +71,8 @@ export interface DashboardStatus {
   trading_locked: boolean;
   lock_reason: string | null;
   account_balance: number | null;
+  account_equity: number | null;
+  open_pnl: number | null;
   available_funds: number | null;
   today_pl: number | null;
   weekly_pl: number | null;

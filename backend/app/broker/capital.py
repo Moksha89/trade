@@ -123,6 +123,8 @@ class CapitalClient:
         return {
             "balance": float(bal.get("balance", 0.0)),
             "available": float(bal.get("available", 0.0)),
+            "pnl": float(bal.get("profitLoss", 0.0) or 0.0),
+            "deposit": float(bal.get("deposit", 0.0) or 0.0),
         }
 
     def discover_markets(self, search: str) -> list[dict[str, Any]]:

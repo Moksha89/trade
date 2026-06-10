@@ -21,6 +21,7 @@ from app.db import get_db
 from app.models import AuditLog, JournalSnapshot, Trade, TradeIdea
 from app.services import accounts, emergency, engine
 from app.services.audit import log_event
+from app.services.live_pricing import live_mark
 from app.services.settings_store import (
     AI,
     BROKER_RUNTIME,
@@ -131,7 +132,14 @@ def list_trades(status: str | None = None, limit: int = 100, db: Session = Depen
     stmt = select(Trade).order_by(desc(Trade.id)).limit(limit)
     if status:
         stmt = select(Trade).where(Trade.status == status).order_by(desc(Trade.id)).limit(limit)
-    return [trade_to_dict(t) for t in db.scalars(stmt)]
+    trades = list(db.scalars(stmt))
+    # Re-price open trades live on read so uP/L and current price move every poll
+    # instead of only every 30s when the worker re-marks. In-memory only (the
+    # request session is never committed).
+    for t in trades:
+        if t.status == "open":
+            live_mark(t)
+    return [trade_to_dict(t) for t in trades]
 
 
 @router.post("/trades/{trade_id}/close")
