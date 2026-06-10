@@ -63,6 +63,12 @@ def default_risk() -> dict[str, Any]:
         # if missing and grade the setup. manual_stop_atr_mult sizes that stop.
         "manage_manual_trades": True,
         "manual_stop_atr_mult": 1.5,
+        # Trailing exit for manual trades: no fixed take-profit ceiling — the
+        # stop ratchets behind the market so winners run until a real pullback.
+        # manual_trail_start_R is the profit (in R) at which the ATR trail kicks
+        # in (breakeven/lock already protect before that).
+        "manual_trailing_tp": True,
+        "manual_trail_start_R": 1.0,
         "hedging_enabled": env.hedging_enabled,
         "news_filter_enabled": True,
         "market_hours_filter_enabled": True,

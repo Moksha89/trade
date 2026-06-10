@@ -80,6 +80,15 @@ class BrokerExecutor:
         except CapitalError as exc:
             return ExecutionResult(ok=False, error=str(exc), deal_id=deal_id)
 
+    def clear_take_profit(self, deal_id: str | None) -> ExecutionResult:
+        if not deal_id:
+            return ExecutionResult(ok=False, error="missing deal_id")
+        try:
+            self.client.clear_take_profit(deal_id)
+            return ExecutionResult(ok=True, deal_id=deal_id)
+        except CapitalError as exc:
+            return ExecutionResult(ok=False, error=str(exc), deal_id=deal_id)
+
     def close(self, deal_id: str | None, price: float) -> ExecutionResult:
         if not deal_id:
             return ExecutionResult(ok=False, error="missing deal_id")

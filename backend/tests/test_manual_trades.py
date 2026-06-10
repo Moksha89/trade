@@ -81,7 +81,7 @@ class _Prov:
         return FX
 
 
-def _exec(calls):
+def _exec(calls, cleared=None):
     class _E:
         mode = "live"
 
@@ -89,10 +89,21 @@ def _exec(calls):
             calls.append((sl, tp))
             return types.SimpleNamespace(ok=True, error=None)
 
+        def clear_take_profit(self, deal_id):
+            if cleared is not None:
+                cleared.append(deal_id)
+            return types.SimpleNamespace(ok=True, error=None)
+
     return _E()
 
 
-def test_protect_attaches_sltp_when_missing(monkeypatch):
+def _risk(trailing_tp=True):
+    r = default_risk()
+    r["manual_trailing_tp"] = trailing_tp
+    return r
+
+
+def test_protect_attaches_stop_only_trailing_default(monkeypatch):
     db = SessionLocal()
     _clear(db)
     # Adopted manual long with NO stop (adoption stores stop==entry) and no TP.
@@ -107,24 +118,50 @@ def test_protect_attaches_sltp_when_missing(monkeypatch):
     _patch_analysis(monkeypatch, 2.0, _sig(True, False, True, False), {"1H": "up", "4H": "up"})
     calls: list = []
 
-    # Price still at entry (100): ATR stop 3.0 below, TP 6.0 above; both clear
-    # the min-distance buffer so the entry-based levels stand.
-    engine._protect_and_grade_manual(db, _Prov(100.0, 100.0), _exec(calls), t, default_risk(), live=True)
+    # Trailing default: a protective stop is attached (97.0) but NO fixed TP, so
+    # the winner can ride. The ATR trail is armed via trail_start_R.
+    engine._protect_and_grade_manual(db, _Prov(100.0, 100.0), _exec(calls), t, _risk(True), live=True)
+    db.refresh(t)
+
+    assert (97.0, None) in calls
+    assert all(tp is None for _, tp in calls)  # no take-profit ever sent
+    assert t.stop_loss == 97.0 and (t.take_profit_1 or 0) == 0
+    assert t.management_plan["manual_protected"] is True
+    assert t.management_plan["trail_start_R"] == 1.0
+    assert t.management_plan["grade"] == "good"
+    _clear(db)
+
+
+def test_protect_attaches_sltp_when_missing_legacy(monkeypatch):
+    db = SessionLocal()
+    _clear(db)
+    # Legacy fixed-TP mode (manual_trailing_tp=False): SL + TP both attached.
+    t = Trade(
+        idea_id=None, mode="live", instrument="US100", direction="long",
+        strategy="manual", entry_price=100.0, size=0.05, stop_loss=100.0,
+        take_profit_1=0.0, current_price=100.0, status="open",
+        management_plan={}, deal_id="DZ",
+    )
+    db.add(t)
+    db.commit()
+    _patch_analysis(monkeypatch, 2.0, _sig(True, False, True, False), {"1H": "up", "4H": "up"})
+    calls: list = []
+
+    engine._protect_and_grade_manual(db, _Prov(100.0, 100.0), _exec(calls), t, _risk(False), live=True)
     db.refresh(t)
 
     # SL and TP are sent as separate calls.
     assert (97.0, None) in calls and (None, 106.0) in calls
     assert t.stop_loss == 97.0 and t.take_profit_1 == 106.0
     assert t.management_plan["manual_protected"] is True
-    assert t.management_plan["grade"] == "good"
     _clear(db)
 
 
-def test_protect_keeps_existing_user_stop(monkeypatch):
+def test_protect_keeps_existing_user_stop_legacy(monkeypatch):
     db = SessionLocal()
     _clear(db)
-    # User already set a stop (95) but no TP — only the TP should be added,
-    # using the user's stop distance (5.0) for the RR.
+    # Legacy fixed-TP mode: user already set a stop (95) but no TP — only the TP
+    # should be added, using the user's stop distance (5.0) for the RR.
     t = Trade(
         idea_id=None, mode="live", instrument="US100", direction="long",
         strategy="manual", entry_price=100.0, size=0.05, stop_loss=95.0,
@@ -136,12 +173,40 @@ def test_protect_keeps_existing_user_stop(monkeypatch):
     _patch_analysis(monkeypatch, 2.0, _sig(True, False, True, False), {"1H": "up", "4H": "up"})
     calls: list = []
 
-    engine._protect_and_grade_manual(db, _Prov(100.0, 100.0), _exec(calls), t, default_risk(), live=True)
+    engine._protect_and_grade_manual(db, _Prov(100.0, 100.0), _exec(calls), t, _risk(False), live=True)
     db.refresh(t)
 
     # Only a TP call (entry + 5.0 * RR 2.0 = 110); the user's stop is untouched.
     assert calls == [(None, 110.0)]
     assert t.stop_loss == 95.0 and t.take_profit_1 == 110.0
+    _clear(db)
+
+
+def test_trailing_clears_preexisting_broker_tp(monkeypatch):
+    db = SessionLocal()
+    _clear(db)
+    # A manual trade that already carries a fixed broker TP (set before trailing
+    # was enabled) must have that TP removed so the trailing stop is the exit.
+    t = Trade(
+        idea_id=None, mode="live", instrument="GOLD", direction="long",
+        strategy="manual", entry_price=100.0, size=0.05, stop_loss=97.0,
+        take_profit_1=106.0, current_price=101.0, status="open",
+        management_plan={"manual_protected": True}, deal_id="DT",
+    )
+    db.add(t)
+    db.commit()
+    _patch_analysis(monkeypatch, 2.0, _sig(False, False, True, False), {"1H": "up", "4H": "up"})
+    calls: list = []
+    cleared: list = []
+
+    engine._protect_and_grade_manual(
+        db, _Prov(101.0, 101.0), _exec(calls, cleared), t, _risk(True), live=True
+    )
+    db.refresh(t)
+
+    assert cleared == ["DT"]
+    assert (t.take_profit_1 or 0) == 0
+    assert t.management_plan["manual_tp_cleared"] is True
     _clear(db)
 
 
@@ -162,7 +227,7 @@ def test_protect_clamps_tp_to_valid_side_of_price(monkeypatch):
     _patch_analysis(monkeypatch, 4.5, _sig(True, False, False, True), {"1H": "down", "4H": "down"})
     calls: list = []
 
-    engine._protect_and_grade_manual(db, _Prov(4087.0, 4087.0), _exec(calls), t, default_risk(), live=True)
+    engine._protect_and_grade_manual(db, _Prov(4087.0, 4087.0), _exec(calls), t, _risk(False), live=True)
     db.refresh(t)
 
     # Stop sits above the live ask; target sits below the live bid (buffer applied).

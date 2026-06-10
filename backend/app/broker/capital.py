@@ -320,6 +320,16 @@ class CapitalClient:
             raise CapitalError(f"modify failed: {resp.status_code} {resp.text}")
         return resp.json()
 
+    def clear_take_profit(self, deal_id: str) -> dict[str, Any]:
+        """Remove the server-side take-profit from a position (set profitLevel
+        to null) so the trade can run on a trailing stop with no fixed ceiling."""
+        resp = self._request(
+            "PUT", f"/api/v1/positions/{deal_id}", json={"profitLevel": None}
+        )
+        if resp.status_code != 200:
+            raise CapitalError(f"clear TP failed: {resp.status_code} {resp.text}")
+        return resp.json()
+
     def close_position(self, deal_id: str) -> dict[str, Any]:
         resp = self._request("DELETE", f"/api/v1/positions/{deal_id}")
         if resp.status_code != 200:

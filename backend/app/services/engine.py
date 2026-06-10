@@ -882,11 +882,22 @@ def _protect_and_grade_manual(
     entry = trade.entry_price
     is_long = trade.direction == "long"
 
+    # Manual trades use a TRAILING exit by default: a protective stop is set,
+    # then the stop ratchets behind the market (breakeven → lock → ATR trail) so
+    # the winner runs as long as the move lasts and only closes on a real
+    # pullback — no fixed take-profit ceiling that would cash it out early.
+    trailing_tp = bool(risk.get("manual_trailing_tp", True))
+    manual_trail_R = float(risk.get("manual_trail_start_R", 1.0))
+    if trailing_tp:
+        plan["trail_start_R"] = manual_trail_R  # engage the ATR trail once in profit
+
     # 1. Attach a protective SL/TP if the manual trade is missing either (once).
     #    Only in live/demo — paper has no real broker position to modify.
     if live and not plan.get("manual_protected"):
         has_sl = bool(trade.stop_loss) and trade.stop_loss > 0 and abs(trade.stop_loss - entry) > 1e-9
-        has_tp = bool(trade.take_profit_1) and trade.take_profit_1 > 0
+        # With a trailing exit there is no fixed target, so treat the TP as
+        # "already handled" and never attach one — the trailing stop is the exit.
+        has_tp = trailing_tp or (bool(trade.take_profit_1) and trade.take_profit_1 > 0)
         atr = float(ind.atr or 0.0)
         rr = float(risk.get("min_risk_reward", 2.0))
         mult = _risk_unit_multiplier(provider, trade.instrument)
@@ -971,11 +982,43 @@ def _protect_and_grade_manual(
                      "tp": trade.take_profit_1 if tp_ok else None, "rpu": rpu},
                     instrument=trade.instrument,
                 )
+                exit_desc = (
+                    "trailing stop (no fixed TP)" if trailing_tp
+                    else f"TP {trade.take_profit_1}"
+                )
                 notify(
                     f"🛡️ Protected your manual {trade.instrument} {trade.direction.upper()}: "
-                    f"SL {trade.stop_loss} / TP {trade.take_profit_1} "
+                    f"SL {trade.stop_loss} / {exit_desc} "
                     f"(risk ≤ {trade.initial_risk_aed} AED)"
                 )
+
+    # 1b. Trailing exit: if a manual trade still carries a fixed broker TP (set
+    #     before trailing was enabled, or attached manually), remove it once so
+    #     the trailing stop is the sole exit and the winner isn't capped early.
+    if live and trailing_tp and not plan.get("manual_tp_cleared"):
+        if bool(trade.take_profit_1) and trade.take_profit_1 > 0:
+            res = executor.clear_take_profit(trade.deal_id)
+            if res.ok:
+                old_tp = trade.take_profit_1
+                trade.take_profit_1 = 0.0
+                trade.take_profit_2 = 0.0
+                plan["manual_tp_cleared"] = True
+                log_event(
+                    db, "manual_tp_cleared",
+                    {"trade_id": trade.id, "deal_id": trade.deal_id, "old_tp": old_tp},
+                    instrument=trade.instrument,
+                )
+                notify(
+                    f"🎯 {trade.instrument} {trade.direction.upper()}: removed fixed TP "
+                    f"{old_tp} — now running on a trailing stop so profit can ride the move"
+                )
+            else:
+                log_event(
+                    db, "manual_tp_clear_failed",
+                    {"trade_id": trade.id, "error": res.error}, instrument=trade.instrument,
+                )
+        else:
+            plan["manual_tp_cleared"] = True  # nothing to clear; record so we skip next cycle
 
     # 2. Grade the setup (refreshed each cycle) and surface it on the dashboard.
     grade = _grade_setup(trade.direction, signals, htf_trends)
