@@ -11,7 +11,12 @@ export default function TradesPage() {
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(() => {
-    listTrades("open").then(setOpen).catch((e) => setError(e.message));
+    listTrades("open")
+      .then((t) => {
+        setOpen(t);
+        setError(null); // a good poll clears any stale transient-error banner
+      })
+      .catch((e) => setError(e.message));
     listTrades("closed").then(setClosed).catch(() => undefined);
   }, []);
 

@@ -30,6 +30,12 @@ export async function login(username: string, password: string): Promise<void> {
   setToken(data.access_token);
 }
 
+// Gateway errors (502/503/504) are almost always a brief blip while the API
+// container restarts during a deploy. For idempotent GETs we retry a couple of
+// times so a routine restart never surfaces a scary error to the user.
+const TRANSIENT = new Set([502, 503, 504]);
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const token = getToken();
   const headers: Record<string, string> = {
@@ -37,22 +43,46 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   };
   if (token) headers["Authorization"] = `Bearer ${token}`;
   if (init.body) headers["Content-Type"] = "application/json";
-  const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
-  if (res.status === 401) {
-    clearToken();
-    throw new Error("unauthorized");
-  }
-  if (!res.ok) {
-    let detail = `request failed (${res.status})`;
+
+  const method = (init.method ?? "GET").toUpperCase();
+  const retriable = method === "GET";
+  const maxAttempts = retriable ? 3 : 1;
+
+  let lastErr: Error = new Error("request failed");
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let res: Response;
     try {
-      const j = await res.json();
-      if (j.detail) detail = j.detail;
-    } catch {
-      /* ignore */
+      res = await fetch(`${API_BASE}${path}`, { ...init, headers });
+    } catch (e) {
+      // Network/connection error (e.g. proxy momentarily down) — retry GETs.
+      lastErr = e as Error;
+      if (retriable && attempt < maxAttempts) {
+        await sleep(400 * attempt);
+        continue;
+      }
+      throw lastErr;
     }
-    throw new Error(detail);
+    if (res.status === 401) {
+      clearToken();
+      throw new Error("unauthorized");
+    }
+    if (!res.ok) {
+      if (retriable && TRANSIENT.has(res.status) && attempt < maxAttempts) {
+        await sleep(400 * attempt);
+        continue;
+      }
+      let detail = `request failed (${res.status})`;
+      try {
+        const j = await res.json();
+        if (j.detail) detail = j.detail;
+      } catch {
+        /* ignore */
+      }
+      throw new Error(detail);
+    }
+    return res.json() as Promise<T>;
   }
-  return res.json() as Promise<T>;
+  throw lastErr;
 }
 
 export const apiGet = <T>(p: string) => request<T>(p);
