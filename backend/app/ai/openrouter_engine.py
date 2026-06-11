@@ -29,9 +29,9 @@ logger = logging.getLogger(__name__)
 
 # Models chosen for speed, structured-output quality, and cost-effectiveness.
 DEFAULT_MODELS = [
-    "google/gemini-2.0-flash-001",
+    "google/gemini-2.5-flash",
     "meta-llama/llama-3.1-70b-instruct",
-    "mistralai/mistral-small-2501",
+    "mistralai/mistral-small-3.2-24b-instruct",
 ]
 
 

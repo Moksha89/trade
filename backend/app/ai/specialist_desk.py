@@ -221,10 +221,10 @@ def _call_specialist(
 # Each role gets a different model to leverage different strengths.
 
 ROLE_MODELS = {
-    "analyst": "google/gemini-2.0-flash-001",          # Fast, great at structured analysis
+    "analyst": "google/gemini-2.5-flash",               # Fast, great at structured analysis
     "pattern": "meta-llama/llama-3.1-70b-instruct",    # Strong pattern recognition
-    "signal": "mistralai/mistral-small-2501",           # Good decision-making, fast
-    "risk": "google/gemini-2.0-flash-001",             # Precise with numbers
+    "signal": "mistralai/mistral-small-3.2-24b-instruct",  # Good decision-making, fast
+    "risk": "google/gemini-2.5-flash",                 # Precise with numbers
     "manager": "meta-llama/llama-3.1-70b-instruct",    # Good at reasoning about evolving situations
 }
 
