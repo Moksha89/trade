@@ -1271,6 +1271,48 @@ def manage_open_trades(db: Session) -> None:
             except Exception:  # noqa: BLE001
                 trail_level = None
 
+        # Ask the AI Trade Manager for dynamic adjustments (non-blocking:
+        # if it fails the deterministic rules below still apply).
+        ai_trail_override = None
+        if trail_started and settings.openrouter_api_key:
+            try:
+                from app.ai.specialist_desk import ai_manage_trade
+                ai_result = ai_manage_trade(
+                    {
+                        "instrument": trade.instrument,
+                        "direction": trade.direction,
+                        "entry_price": trade.entry_price,
+                        "current_price": price,
+                        "stop_loss": trade.stop_loss,
+                        "take_profit_1": trade.take_profit_1,
+                        "current_r": round(cur_r, 2),
+                        "atr": float(ind.atr) if ind else 0,
+                        "risk_per_unit": rpu,
+                    },
+                    ind.as_dict() if ind else {},
+                )
+                if ai_result.get("action") == "close":
+                    close_trade(db, trade, price, f"ai_manager: {ai_result.get('reason', 'close')}")
+                    db.commit()
+                    continue
+                if ai_result.get("trail_atr_mult") and trail_level is not None and ind:
+                    ai_mult = float(ai_result["trail_atr_mult"])
+                    if 1.0 <= ai_mult <= 4.0:
+                        if trade.direction == "long":
+                            ai_trail_override = ind.price - ai_mult * ind.atr
+                        else:
+                            ai_trail_override = ind.price + ai_mult * ind.atr
+            except Exception:  # noqa: BLE001
+                pass  # Deterministic rules still run below
+
+        # Use AI trail if tighter than deterministic trail.
+        effective_trail = trail_level
+        if ai_trail_override is not None and trail_level is not None:
+            if trade.direction == "long":
+                effective_trail = max(trail_level, ai_trail_override)
+            else:
+                effective_trail = min(trail_level, ai_trail_override)
+
         actions = compute_management_actions(
             direction=trade.direction,
             entry=trade.entry_price,
@@ -1281,7 +1323,7 @@ def manage_open_trades(db: Session) -> None:
             breakeven_done=trade.breakeven_moved,
             profit_locked=trade.profit_locked,
             partial_done=trade.partial_closed,
-            trail_level=trail_level,
+            trail_level=effective_trail,
         )
 
         if actions.close:

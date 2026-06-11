@@ -229,8 +229,12 @@ def propose_trade(
 ) -> tuple[TradeProposal, dict[str, Any], str]:
     """Return (proposal, payload, prompt_hash).
 
-    Priority: OpenRouter consensus → Claude → Ollama → heuristic fallback.
-    OpenRouter calls 3 models in parallel and requires 2/3 agreement.
+    Priority:
+      1. Specialist Desk (4 AI experts in pipeline) — best quality
+      2. OpenRouter consensus (3 models vote) — fallback
+      3. Claude — secondary fallback
+      4. Ollama — tertiary fallback
+      5. Heuristic — auto-reject
     """
     import logging
 
@@ -240,8 +244,30 @@ def propose_trade(
     phash = prompt_hash(payload)
     model = model or settings.anthropic_model
 
-    # Try OpenRouter multi-model consensus first.
+    # Try Specialist Desk first (4 expert AIs in pipeline).
     if settings.openrouter_api_key:
+        try:
+            from app.ai.specialist_desk import run_specialist_pipeline
+
+            proposal, meta = run_specialist_pipeline(
+                payload, instrument,
+                api_key=settings.openrouter_api_key,
+            )
+            stages = meta.get("stages", {})
+            logger.info(
+                "Specialist Desk for %s: analyst=%s pattern=%s signal=%s risk=%s (%dms)",
+                instrument,
+                stages.get("analyst", {}).get("result", {}).get("directional_bias"),
+                stages.get("pattern", {}).get("result", {}).get("pattern_bias"),
+                stages.get("signal", {}).get("result", {}).get("decision"),
+                stages.get("risk", {}).get("status"),
+                meta.get("total_latency_ms", 0),
+            )
+            return proposal, payload, phash
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Specialist Desk failed for %s: %s — trying consensus", instrument, exc)
+
+        # Fall back to consensus voting if specialist pipeline breaks.
         try:
             from app.ai.openrouter_engine import propose_trade_consensus
 
