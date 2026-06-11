@@ -51,9 +51,10 @@ SCHEMA_HINT = {
     "invalidation_condition": "when this setup becomes invalid",
     "risk_flags": [],
     "management_plan": {
-        "move_sl_to_breakeven_at_R": 0.7,
-        "lock_profit_at_R": 1.0,
-        "lock_profit_offset_R": 0.3,
+        "move_sl_to_breakeven_at_R": 1.2,
+        "lock_profit_at_R": 1.5,
+        "lock_profit_offset_R": 0.5,
+        "trail_atr_mult": 2.5,
         "partial_close_at_R": 2.0,
         "partial_close_percent": 50,
         "trail_start_R": 2.0,
@@ -156,7 +157,10 @@ def _heuristic_proposal(
             risk_flags=["heuristic_fallback"],
         )
 
-    confidence = 72.0 if condition != MarketCondition.MOMENTUM else 70.0
+    # Heuristic fallback proposals are NOT real AI analysis — set confidence
+    # below the risk engine threshold (70) so they are always rejected. This
+    # prevents random entries when the AI is unavailable.
+    confidence = 50.0
     return TradeProposal(
         instrument=instrument,
         direction=direction,
@@ -169,6 +173,7 @@ def _heuristic_proposal(
         confidence=confidence,
         risk_reward=round(rr(price, sl, tp1), 2),
         rationale=(
+            f"[HEURISTIC FALLBACK — AI unavailable] "
             f"{strategy.value} on {condition.value}: EMA trend={ind.trend}, "
             f"RSI={ind.rsi:.0f}, MACD hist={ind.macd_hist:.4f}."
         ),

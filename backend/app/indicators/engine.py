@@ -116,6 +116,63 @@ def _swings(high: np.ndarray, low: np.ndarray, lookback: int = 20) -> tuple[floa
     return float(window_high.max()), float(window_low.min())
 
 
+def _pivot_swing_levels(
+    high: np.ndarray, low: np.ndarray, close: np.ndarray, price: float, atr: float,
+) -> tuple[float, float]:
+    """Multi-scale support/resistance from fractal swing points.
+
+    Scans three lookback windows (short=20, medium=50, long=100 bars) for
+    local swing highs/lows, then picks the nearest relevant levels above and
+    below the current price. Nearby duplicate levels (within 0.5 ATR) are
+    merged so the result reflects actual structure rather than noise.
+    """
+    n = len(high)
+    if n < 5:
+        return float(low.min()), float(high.max())
+
+    # Detect fractal swing points: a bar whose high/low exceeds its 2
+    # neighbours on each side.
+    swing_highs: list[float] = []
+    swing_lows: list[float] = []
+    for lookback in (20, 50, 100):
+        window = min(lookback, n)
+        h = high[-window:]
+        l = low[-window:]
+        for i in range(2, len(h) - 2):
+            if h[i] >= h[i - 1] and h[i] >= h[i - 2] and h[i] >= h[i + 1] and h[i] >= h[i + 2]:
+                swing_highs.append(float(h[i]))
+            if l[i] <= l[i - 1] and l[i] <= l[i - 2] and l[i] <= l[i + 1] and l[i] <= l[i + 2]:
+                swing_lows.append(float(l[i]))
+
+    # Add the overall range boundaries as fallback levels.
+    swing_highs.append(float(high[-100:].max()) if n >= 100 else float(high.max()))
+    swing_lows.append(float(low[-100:].min()) if n >= 100 else float(low.min()))
+
+    # Merge levels within 0.5 ATR of each other (keep the one with more
+    # touches, approximated by keeping the median of each cluster).
+    merge_dist = max(atr * 0.5, price * 0.0005) if atr > 0 else price * 0.001
+
+    def _cluster(levels: list[float]) -> list[float]:
+        if not levels:
+            return levels
+        levels = sorted(levels)
+        clusters: list[list[float]] = [[levels[0]]]
+        for lv in levels[1:]:
+            if lv - clusters[-1][-1] <= merge_dist:
+                clusters[-1].append(lv)
+            else:
+                clusters.append([lv])
+        return [float(np.median(c)) for c in clusters]
+
+    res_levels = _cluster(swing_highs)
+    sup_levels = _cluster(swing_lows)
+
+    # Nearest resistance above price; nearest support below price.
+    resistance = min((r for r in res_levels if r > price), default=float(high.max()))
+    support = max((s for s in sup_levels if s < price), default=float(low.min()))
+    return support, resistance
+
+
 def compute_indicators(candles: list[Candle]) -> IndicatorSet:
     if len(candles) < 2:
         raise ValueError("need at least 2 candles to compute indicators")
@@ -135,9 +192,8 @@ def compute_indicators(candles: list[Candle]) -> IndicatorSet:
     vwap = _vwap(high, low, close, volume)
     swing_high, swing_low = _swings(high, low)
 
-    # Support/resistance: nearest swing levels relative to price.
-    resistance = swing_high
-    support = swing_low
+    # Support/resistance: multi-scale fractal pivot levels.
+    support, resistance = _pivot_swing_levels(high, low, close, price, atr)
 
     volatility_pct = (atr / price * 100.0) if price else 0.0
 

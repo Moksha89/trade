@@ -15,6 +15,8 @@ import threading
 import time
 from datetime import datetime, timezone
 
+import zoneinfo
+
 from sqlalchemy.orm import Session
 
 from app.ai.engine import propose_trade
@@ -71,21 +73,31 @@ def _entry_signals(ind, candles, zone_pct: float) -> dict[str, bool]:
     """Setup-quality signals from the entry-timeframe indicators and candles.
 
     - at_support / at_resistance: price sits within `zone_pct`% of a swing level.
-    - bullish/bearish_confirmation: latest candle direction agrees with MACD
-      momentum (no buying into bearish momentum / shorting into bullish).
+    - bullish/bearish_confirmation: requires 2 of the last 3 candles to agree
+      with the direction AND MACD histogram momentum. This filters out single-
+      candle noise that triggered false entries in the previous version.
     """
     price = float(ind.price)
     zone = zone_pct / 100.0
     at_support = price > 0 and abs(price - ind.support) / price <= zone
     at_resistance = price > 0 and abs(ind.resistance - price) / price <= zone
-    last = candles[-1]
-    green = last.close > last.open
-    red = last.close < last.open
+
+    # Multi-candle confirmation: require 2 of the last 3 candles to agree.
+    recent = candles[-3:] if len(candles) >= 3 else candles
+    green_count = sum(1 for c in recent if c.close > c.open)
+    red_count = sum(1 for c in recent if c.close < c.open)
+    # MACD histogram must show meaningful momentum (> 20% of ATR as threshold)
+    # to avoid triggering on flat/noisy histogram near zero.
+    macd_threshold = ind.atr * 0.0002 if ind.atr > 0 else 0.0
     return {
         "at_support": bool(at_support),
         "at_resistance": bool(at_resistance),
-        "bullish_confirmation": bool(green and ind.macd_hist > 0),
-        "bearish_confirmation": bool(red and ind.macd_hist < 0),
+        "bullish_confirmation": bool(
+            green_count >= 2 and ind.macd_hist > macd_threshold
+        ),
+        "bearish_confirmation": bool(
+            red_count >= 2 and ind.macd_hist < -macd_threshold
+        ),
     }
 
 
@@ -192,6 +204,35 @@ def _record_shadow(
 
 
 # --------------------------------------------------------------------------
+# Session filter — only trade during high-liquidity hours
+# --------------------------------------------------------------------------
+_LONDON_TZ = zoneinfo.ZoneInfo("Europe/London")
+
+
+def _in_trading_session(risk: dict) -> bool:
+    """Return True if the current time is within a high-liquidity trading session.
+
+    Default active windows (configurable via risk settings):
+      - London open:   07:00–11:00 UTC (covers London/EU open)
+      - NY overlap:    12:00–16:00 UTC (London + NY overlap, highest liquidity)
+      - NY afternoon:  16:00–20:00 UTC (NY session)
+
+    Outside these hours spreads widen, volume thins, and price action is choppy.
+    Weekends (Sat/Sun) are always skipped.
+    """
+    if not risk.get("session_filter_enabled", True):
+        return True
+    now = datetime.now(timezone.utc)
+    # Skip weekends entirely (Saturday=5, Sunday=6).
+    if now.weekday() >= 5:
+        return False
+    hour = now.hour
+    start = int(risk.get("session_start_hour_utc", 7))
+    end = int(risk.get("session_end_hour_utc", 20))
+    return start <= hour < end
+
+
+# --------------------------------------------------------------------------
 # Scan & propose (every 5 minutes)
 # --------------------------------------------------------------------------
 def run_scan(db: Session) -> list[TradeIdea]:
@@ -205,6 +246,10 @@ def run_scan(db: Session) -> list[TradeIdea]:
 
     if state.trading_locked:
         log_event(db, "scan_skipped", {"reason": "trading locked"})
+        return created
+
+    if not _in_trading_session(risk):
+        log_event(db, "scan_skipped", {"reason": "outside trading session"})
         return created
 
     open_now = accounts.open_trades(db)
@@ -1068,13 +1113,14 @@ def manage_open_trades(db: Session) -> None:
             trade.partial_closed or tp1_hit or cur_r >= float(plan.get("trail_start_R", 2.0))
         )
         trail_level = None
+        trail_atr_mult = float(plan.get("trail_atr_mult", 2.5))
         if trail_started:
             try:
                 ind = compute_indicators(provider.get_candles(trade.instrument, "5M", 60))
                 if trade.direction == "long":
-                    trail_level = ind.price - ind.atr
+                    trail_level = ind.price - trail_atr_mult * ind.atr
                 else:
-                    trail_level = ind.price + ind.atr
+                    trail_level = ind.price + trail_atr_mult * ind.atr
             except Exception:  # noqa: BLE001
                 trail_level = None
 
