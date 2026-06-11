@@ -74,7 +74,7 @@ def main() -> None:
     scheduler = BlockingScheduler(timezone="UTC")
     scheduler.add_job(cycle_30s, "interval", seconds=30, id="health_manage",
                       max_instances=1, coalesce=True)
-    scheduler.add_job(cycle_5m, "interval", minutes=15, id="scan_propose",
+    scheduler.add_job(cycle_5m, "interval", minutes=5, id="scan_propose",
                       max_instances=1, coalesce=True)
     scheduler.add_job(cycle_15m, "interval", minutes=15, id="journal",
                       max_instances=1, coalesce=True)
