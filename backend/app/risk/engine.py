@@ -221,6 +221,17 @@ def evaluate_proposal(
     if risk_per_unit <= 0:
         return reject("Zero stop distance")
 
+    # 5b. Minimum stop distance relative to ATR.
+    # Prevents the AI from proposing impossibly tight stops (e.g. 5 pips on
+    # EURUSD 15M) that any normal fill slippage will blow past the risk cap.
+    if not skip_setup_quality:
+        min_stop_atr = float(risk.get("min_stop_atr_multiple", 0.5))
+        if ctx.atr > 0 and risk_per_unit < min_stop_atr * ctx.atr:
+            return reject(
+                f"Stop distance {risk_per_unit:.4g} too tight "
+                f"(<{min_stop_atr:g}\u00d7 ATR {ctx.atr:.4g})"
+            )
+
     # 6. Minimum risk/reward.
     reward = abs(tp - entry)
     rr = reward / risk_per_unit
@@ -313,7 +324,12 @@ def evaluate_proposal(
     # so the AED risk budget sizes the position correctly.
     if ctx.account_ccy_per_point <= 0:
         return reject("Cannot size: unverified currency conversion for instrument")
-    risk_per_unit_acct = risk_per_unit * ctx.account_ccy_per_point
+    # Add slippage buffer: size as if the stop is wider by 2× spread so that
+    # normal fill slippage doesn't push actual risk past the per-trade cap and
+    # trigger an abort (which wastes spread cost for no benefit).
+    slippage_buffer = 2.0 * max(ctx.spread_points, 0.0)
+    risk_per_unit_buffered = risk_per_unit + slippage_buffer
+    risk_per_unit_acct = risk_per_unit_buffered * ctx.account_ccy_per_point
     if risk_per_unit_acct <= 0:
         return reject("Zero stop distance")
     size = risk_budget / risk_per_unit_acct

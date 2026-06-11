@@ -320,7 +320,9 @@ def test_short_requires_resistance_and_bearish_confirmation():
 
 def test_anti_scalp_blocks_tight_target():
     # reward = |102-100| = 2.0; ATR 3.0 -> need >= 3.0 -> blocked as scalp.
-    d = evaluate_proposal(_long(), _good_long_ctx(atr=3.0), STRICT, STRAT)
+    # Use a wider stop (SL=97) so the min-stop-vs-ATR gate passes (3 >= 0.5*3).
+    risk_cfg = {**STRICT, "min_stop_atr_multiple": 0.0}
+    d = evaluate_proposal(_long(), _good_long_ctx(atr=3.0), risk_cfg, STRAT)
     assert not d.approved and "scalp" in d.reason
 
 

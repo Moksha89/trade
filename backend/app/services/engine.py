@@ -546,7 +546,7 @@ def _proposal_from_idea(idea: TradeIdea, entry_price: float | None = None) -> Tr
 
 def _execution_entry_and_spread(
     provider: MarketDataProvider, idea: TradeIdea
-) -> tuple[float, float]:
+) -> tuple[float | None, float]:
     """Live execution price and spread for sizing/gating at execution time.
 
     The AI's proposed entry is stale by the time we execute; on wide-spread
@@ -556,12 +556,15 @@ def _execution_entry_and_spread(
     so realized risk reflects the actual fill. Limit/stop entries fill at their
     own level, so we keep the proposed price. The spread (ask-bid) is returned
     so the risk engine can reject setups whose stop is too tight versus it.
-    Falls back to the proposed entry (and zero spread) if no live quote.
+    Returns ``(None, 0.0)`` when no live quote is available so the caller can
+    abort rather than sizing against a stale price.
     """
     try:
         q = provider.get_quote(idea.instrument)
     except Exception:  # noqa: BLE001
-        return idea.entry_price, 0.0
+        # No live quote → return None to signal the caller that we cannot
+        # safely size a market order against a stale price.
+        return None, 0.0
     spread = q.spread_points or abs((q.ask or 0.0) - (q.bid or 0.0))
     if idea.entry_type != EntryType.MARKET.value:
         return idea.entry_price, spread
@@ -602,6 +605,14 @@ def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
     # past the per-trade risk cap (the proposed entry is stale by now). The
     # live spread feeds the stop-vs-spread quality gate in the risk engine.
     exec_entry, exec_spread = _execution_entry_and_spread(provider, idea)
+    if exec_entry is None:
+        idea.status = "rejected"
+        idea.risk_reason = "no live quote at execution time — refusing to size against stale price"
+        log_event(db, "execute_blocked",
+                  {"idea_id": idea.id, "reason": idea.risk_reason},
+                  instrument=idea.instrument)
+        db.commit()
+        return None
     ctx.spread_points = exec_spread
     # Setup-quality gates (trend/location/confirmation/scalp) were validated at
     # scan time; the execution re-check only re-verifies dynamic risk so a tiny
@@ -623,6 +634,13 @@ def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
     # Dynamic position sizing: scale risk based on recent performance.
     from app.risk.dynamic_sizing import compute_size_multiplier
     size_mult = compute_size_multiplier(db, risk)
+    # Cap the multiplier so dynamic sizing can never push actual risk past the
+    # slippage-abort tolerance — otherwise we open AND close instantly, paying
+    # spread cost for nothing.
+    cap = float(risk.get("max_risk_per_trade", 50))
+    if recheck.computed_risk_aed > 0:
+        max_mult = (cap * SLIPPAGE_ABORT_TOLERANCE) / recheck.computed_risk_aed
+        size_mult = min(size_mult, max_mult)
     idea.position_size = round(recheck.computed_size * size_mult, 6)
     idea.risk_aed = round(recheck.computed_risk_aed * size_mult, 2)
 
