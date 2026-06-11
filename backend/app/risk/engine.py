@@ -166,19 +166,19 @@ def evaluate_proposal(
             return reject(
                 f"Direction mismatch: long in {cls} market"
             )
-        # Momentum classification: only block if ALL HTF timeframes disagree.
-        # The specialist desk already does multi-TF analysis internally, so we
-        # only hard-block when there's unanimous HTF opposition.
+        # Momentum classification: only block when the trade opposes a
+        # UNANIMOUS HTF consensus with at least 2 opposing timeframes.
+        # Single HTF disagreement is acceptable — the specialist desk does
+        # its own multi-TF analysis.
         if cls == "momentum":
             if ctx.htf_trends:
                 up_count = sum(1 for v in ctx.htf_trends.values() if v == "up")
                 down_count = sum(1 for v in ctx.htf_trends.values() if v == "down")
-                total = up_count + down_count
-                if d == Direction.SHORT and total > 0 and down_count == 0:
+                if d == Direction.SHORT and up_count >= 2 and down_count == 0:
                     return reject(
                         "Direction mismatch: short in momentum-up market"
                     )
-                if d == Direction.LONG and total > 0 and up_count == 0:
+                if d == Direction.LONG and down_count >= 2 and up_count == 0:
                     return reject(
                         "Direction mismatch: long in momentum-down market"
                     )
