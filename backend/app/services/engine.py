@@ -266,7 +266,8 @@ def run_scan(db: Session) -> list[TradeIdea]:
         if any(t.instrument == instrument for t in open_now):
             continue
         try:
-            candles = provider.get_candles(instrument, "5M", 250)
+            scan_tf = risk.get("scan_timeframe", "15M")
+            candles = provider.get_candles(instrument, scan_tf, 250)
             ind = compute_indicators(candles)
             snap = provider.get_snapshot(instrument)
         except Exception as exc:  # noqa: BLE001
@@ -895,7 +896,7 @@ def _protect_and_grade_manual(
     control of exiting. All broker/market errors are caught so a manual trade can
     never break the manage loop."""
     try:
-        candles = provider.get_candles(trade.instrument, "5M", 200)
+        candles = provider.get_candles(trade.instrument, "15M", 200)
         ind = compute_indicators(candles)
     except Exception as exc:  # noqa: BLE001
         log_event(
@@ -1116,7 +1117,7 @@ def manage_open_trades(db: Session) -> None:
         trail_atr_mult = float(plan.get("trail_atr_mult", 2.5))
         if trail_started:
             try:
-                ind = compute_indicators(provider.get_candles(trade.instrument, "5M", 60))
+                ind = compute_indicators(provider.get_candles(trade.instrument, "15M", 60))
                 if trade.direction == "long":
                     trail_level = ind.price - trail_atr_mult * ind.atr
                 else:

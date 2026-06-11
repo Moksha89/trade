@@ -2,8 +2,8 @@
 
 Runs the three scheduled cadences from the spec using APScheduler:
   every 30s  → health check + manage open trades
-  every 5m   → scan instruments, classify, AI propose, risk evaluate
-  every 15m  → journal snapshot + Telegram summary
+  every 15m  → scan instruments, classify, AI propose, risk evaluate
+  every 15m  → journal snapshot + Telegram summary (offset)
 
 The scan/auto-execute steps only run while the bot is marked running in
 BotState (toggled from the dashboard). Health + management always run so trades
@@ -74,7 +74,7 @@ def main() -> None:
     scheduler = BlockingScheduler(timezone="UTC")
     scheduler.add_job(cycle_30s, "interval", seconds=30, id="health_manage",
                       max_instances=1, coalesce=True)
-    scheduler.add_job(cycle_5m, "interval", minutes=5, id="scan_propose",
+    scheduler.add_job(cycle_5m, "interval", minutes=15, id="scan_propose",
                       max_instances=1, coalesce=True)
     scheduler.add_job(cycle_15m, "interval", minutes=15, id="journal",
                       max_instances=1, coalesce=True)

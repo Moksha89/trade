@@ -261,41 +261,61 @@ def test_no_htf_data_does_not_block():
     assert d.approved
 
 
-# --- Setup-quality selection filter (4c–4f, 6b) ---
+# --- Setup-quality scoring (4c–4g) ---
 
 def test_long_requires_htf_bullish_bias():
-    # 1H/4H both sideways -> no bullish bias -> blocked even though not opposing.
+    # 1H/4H both sideways -> no bullish bias -> lower score than aligned.
     d = evaluate_proposal(_long(), _good_long_ctx(htf_trends={"1H": "sideways", "4H": "sideways"}), STRICT, STRAT)
-    assert not d.approved and "bias" in d.reason
+    d_aligned = evaluate_proposal(_long(), _good_long_ctx(), STRICT, STRAT)
+    assert d_aligned.quality_score > d.quality_score
 
 
 def test_long_blocked_when_not_at_support():
-    d = evaluate_proposal(_long(), _good_long_ctx(at_support=False), STRICT, STRAT)
-    assert not d.approved and "not at support" in d.reason
+    # Missing support + no HTF bias + no confirmation -> quality too low.
+    d = evaluate_proposal(
+        _long(),
+        _good_long_ctx(at_support=False, htf_trends={}, bullish_confirmation=False),
+        STRICT, STRAT,
+    )
+    assert not d.approved and "Quality score" in d.reason
 
 
 def test_long_blocked_when_into_resistance():
-    d = evaluate_proposal(_long(), _good_long_ctx(at_resistance=True), STRICT, STRAT)
-    assert not d.approved and "into resistance" in d.reason
+    # At resistance + no other factors -> low score, rejected.
+    d = evaluate_proposal(
+        _long(),
+        _good_long_ctx(at_resistance=True, at_support=False, htf_trends={}, bullish_confirmation=False),
+        STRICT, STRAT,
+    )
+    assert not d.approved and "Quality score" in d.reason
 
 
 def test_long_blocked_without_bullish_confirmation():
-    d = evaluate_proposal(_long(), _good_long_ctx(bullish_confirmation=False), STRICT, STRAT)
-    assert not d.approved and "confirmation" in d.reason
+    # Missing confirmation + no HTF + no location -> quality too low.
+    d = evaluate_proposal(
+        _long(),
+        _good_long_ctx(bullish_confirmation=False, htf_trends={}, at_support=False),
+        STRICT, STRAT,
+    )
+    assert not d.approved and "Quality score" in d.reason
 
 
 def test_long_approved_with_full_quality_setup():
     d = evaluate_proposal(_long(), _good_long_ctx(), STRICT, STRAT)
     assert d.approved, d.reason
+    assert d.quality_score >= 40
 
 
 def test_short_requires_resistance_and_bearish_confirmation():
     d = evaluate_proposal(_short(), _good_short_ctx(), STRICT, STRAT)
     assert d.approved, d.reason
-    d2 = evaluate_proposal(_short(), _good_short_ctx(at_resistance=False), STRICT, STRAT)
-    assert not d2.approved and "not at resistance" in d2.reason
-    d3 = evaluate_proposal(_short(), _good_short_ctx(bearish_confirmation=False), STRICT, STRAT)
-    assert not d3.approved and "confirmation" in d3.reason
+    # Missing resistance + confirmation + HTF -> quality too low.
+    d2 = evaluate_proposal(
+        _short(),
+        _good_short_ctx(at_resistance=False, bearish_confirmation=False, htf_trends={}),
+        STRICT, STRAT,
+    )
+    assert not d2.approved and "Quality score" in d2.reason
 
 
 def test_anti_scalp_blocks_tight_target():
@@ -312,12 +332,12 @@ def test_anti_scalp_allows_real_move():
 
 def test_volatility_band_blocks_chaotic_market():
     d = evaluate_proposal(_long(), _good_long_ctx(volatility_pct=12.0), STRICT, STRAT)
-    assert not d.approved and "Volatility" in d.reason
+    assert not d.approved and "volatility" in d.reason.lower()
 
 
 def test_volatility_band_blocks_dead_market():
     d = evaluate_proposal(_long(), _good_long_ctx(volatility_pct=0.001), STRICT, STRAT)
-    assert not d.approved and "Volatility" in d.reason
+    assert not d.approved and "volatility" in d.reason.lower()
 
 
 def test_setup_filters_toggle_off():

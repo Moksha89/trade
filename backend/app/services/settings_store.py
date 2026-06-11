@@ -52,8 +52,9 @@ def default_risk() -> dict[str, Any]:
         "support_zone_pct": 0.75,  # how near a level counts as "at" it
         "require_confirmation": True,  # confirmation candle + momentum
         "min_reward_atr": 1.0,  # anti-scalp: target ≥ N×ATR away
-        "min_volatility_pct": 0.03,  # skip dead markets
-        "max_volatility_pct": 8.0,  # skip chaotic markets
+        "min_volatility_pct": 0.15,  # skip dead markets (ATR < 0.15% of price)
+        "max_volatility_pct": 2.0,  # skip chaotic markets (ATR > 2% of price)
+        "min_quality_score": 40,  # minimum setup quality score (out of 100)
         # Manual trades opened in the broker app: auto-attach a protective SL/TP
         # if missing and grade the setup. manual_stop_atr_mult sizes that stop.
         "manage_manual_trades": True,

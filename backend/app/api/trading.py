@@ -330,7 +330,7 @@ def run_backtest_endpoint(
     from app.backtest.engine import run_backtest
     from app.market_data.factory import get_provider
 
-    candles = get_provider("paper").get_candles(instrument, "5M", bars)
+    candles = get_provider("paper").get_candles(instrument, "15M", bars)
     report = run_backtest(instrument, candles, get_group(db, RISK), get_group(db, STRATEGY))
     log_event(db, "backtest_run", {"instrument": instrument, "trades": report.trades})
     return report.as_dict()
