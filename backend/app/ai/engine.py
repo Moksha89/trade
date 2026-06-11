@@ -217,20 +217,38 @@ def propose_trade(
     context: dict[str, Any] | None = None,
     model: str | None = None,
 ) -> tuple[TradeProposal, dict[str, Any], str]:
-    """Return (proposal, payload, prompt_hash). Falls back to heuristic on error."""
+    """Return (proposal, payload, prompt_hash).
+
+    Priority: Claude → Ollama → heuristic fallback.
+    If Claude credits are exhausted or unavailable, Ollama is used as the
+    primary AI provider. Heuristic is the last resort (auto-rejects).
+    """
     context = context or {}
     payload = build_payload(instrument, ind, condition, context)
     phash = prompt_hash(payload)
     model = model or settings.anthropic_model
 
+    # Try Claude first.
     if settings.anthropic_api_key:
         try:
             proposal = _call_claude(payload, model)
             return proposal, payload, phash
-        except Exception:  # noqa: BLE001 — any failure → safe deterministic fallback
-            proposal = _heuristic_proposal(instrument, ind, condition)
-            proposal.risk_flags = list({*proposal.risk_flags, "ai_error_fallback"})
-            return proposal, payload, phash
+        except Exception:  # noqa: BLE001
+            pass  # Fall through to Ollama
 
+    # Try Ollama as secondary (or primary if no Claude key).
+    try:
+        from app.ai.ollama_engine import propose_trade_ollama
+
+        proposal, _latency = propose_trade_ollama(payload)
+        proposal.instrument = instrument
+        if "ollama_provider" not in proposal.risk_flags:
+            proposal.risk_flags = list({*proposal.risk_flags, "ollama_provider"})
+        return proposal, payload, phash
+    except Exception:  # noqa: BLE001
+        pass  # Fall through to heuristic
+
+    # Last resort: deterministic heuristic (confidence 50 → auto-reject).
     proposal = _heuristic_proposal(instrument, ind, condition)
+    proposal.risk_flags = list({*proposal.risk_flags, "ai_error_fallback"})
     return proposal, payload, phash
