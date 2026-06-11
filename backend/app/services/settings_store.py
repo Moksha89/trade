@@ -61,8 +61,26 @@ def default_risk() -> dict[str, Any]:
         "manual_stop_atr_mult": 1.5,
         "hedging_enabled": env.hedging_enabled,
         "news_filter_enabled": True,
+        "news_buffer_minutes": 30,  # minutes before/after high-impact events
         "market_hours_filter_enabled": True,
         "account_capital": env.account_start_capital,
+        # Drawdown circuit breaker
+        "drawdown_guard_enabled": True,
+        "max_drawdown_pct": 10.0,  # lock trading at 10% from peak
+        "equity_high_water_mark": env.account_start_capital,
+        # Correlation guard
+        "correlation_guard_enabled": True,
+        "max_correlated_positions": 1,  # max positions per correlation group
+        # Dynamic position sizing
+        "dynamic_sizing_enabled": True,
+        # Limit orders
+        "prefer_limit_orders": False,  # use market orders by default
+        # Paper-to-live promotion gate
+        "promotion_gate_enabled": False,  # off by default (already live)
+        "promotion_min_trades": 50,
+        "promotion_min_win_rate": 40.0,
+        "promotion_min_profit_factor": 1.3,
+        "promotion_max_drawdown_pct": 15.0,
     }
 
 

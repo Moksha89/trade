@@ -394,3 +394,53 @@ def broker_reconnect(db: Session = Depends(get_db)) -> dict:
         return {"connected": True, "balance": balance}
     except CapitalError as exc:
         raise HTTPException(502, f"connect failed: {exc}") from exc
+
+
+# ---- analytics -----------------------------------------------------------
+@router.get("/analytics")
+def analytics_endpoint(db: Session = Depends(get_db)) -> dict:
+    from app.services.analytics import compute_analytics
+    risk = get_group(db, RISK)
+    capital = float(risk.get("account_capital", settings.account_start_capital))
+    return compute_analytics(db, capital)
+
+
+# ---- promotion gate ------------------------------------------------------
+@router.get("/promotion/status")
+def promotion_status(db: Session = Depends(get_db)) -> dict:
+    from app.services.promotion import check_promotion_readiness
+    risk = get_group(db, RISK)
+    ready, report = check_promotion_readiness(db, risk)
+    return {"ready": ready, **report}
+
+
+# ---- walk-forward validation ---------------------------------------------
+@router.post("/backtest/walk-forward")
+def walk_forward_endpoint(
+    instrument: str = Body("US100", embed=True),
+    bars: int = Body(2000, embed=True),
+    n_windows: int = Body(5, embed=True),
+    db: Session = Depends(get_db),
+) -> dict:
+    from app.backtest.walk_forward import run_walk_forward
+    from app.market_data.factory import get_provider
+
+    candles = get_provider("paper").get_candles(instrument, "15M", bars)
+    report = run_walk_forward(
+        instrument, candles,
+        risk=get_group(db, RISK),
+        strategy=get_group(db, STRATEGY),
+        n_windows=n_windows,
+    )
+    log_event(db, "walk_forward_run", {
+        "instrument": instrument, "segments": len(report.segments),
+        "robustness": report.robustness_ratio,
+    })
+    return report.as_dict()
+
+
+# ---- rate limiter status -------------------------------------------------
+@router.get("/system/rate-limiter")
+def rate_limiter_status() -> dict:
+    from app.broker.rate_limiter import get_rate_limiter
+    return get_rate_limiter().stats()

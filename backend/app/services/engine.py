@@ -233,7 +233,7 @@ def _in_trading_session(risk: dict) -> bool:
 
 
 # --------------------------------------------------------------------------
-# Scan & propose (every 5 minutes)
+# Scan & propose (every 15 minutes)
 # --------------------------------------------------------------------------
 def run_scan(db: Session) -> list[TradeIdea]:
     risk = get_group(db, RISK)
@@ -251,6 +251,22 @@ def run_scan(db: Session) -> list[TradeIdea]:
     if not _in_trading_session(risk):
         log_event(db, "scan_skipped", {"reason": "outside trading session"})
         return created
+
+    # Drawdown circuit breaker: check account equity vs high-water mark.
+    from app.risk.drawdown import check_drawdown
+    account_capital = float(risk.get("account_capital", settings.account_start_capital))
+    if not check_drawdown(db, account_capital):
+        log_event(db, "scan_skipped", {"reason": "drawdown limit hit"})
+        return created
+
+    # News calendar: skip trading near high-impact events.
+    from app.services.news_calendar import is_near_high_impact_event
+    if risk.get("news_filter_enabled", True):
+        buffer_min = int(risk.get("news_buffer_minutes", 30))
+        near_news, news_desc = is_near_high_impact_event(buffer_min)
+        if near_news:
+            log_event(db, "scan_skipped", {"reason": f"near news: {news_desc}"})
+            return created
 
     open_now = accounts.open_trades(db)
     max_active = int(risk.get("max_active_trades", 2))
@@ -272,6 +288,18 @@ def run_scan(db: Session) -> list[TradeIdea]:
             snap = provider.get_snapshot(instrument)
         except Exception as exc:  # noqa: BLE001
             log_event(db, "market_data_error", {"error": str(exc)}, instrument=instrument)
+            continue
+
+        # Correlation guard: block if we already hold a correlated instrument.
+        from app.risk.correlation import check_correlation
+        open_dicts = [{"instrument": t.instrument, "direction": t.direction} for t in open_now]
+        corr_ok, corr_reason = check_correlation(
+            instrument, "", open_dicts,
+            enabled=risk.get("correlation_guard_enabled", True),
+            max_correlated=int(risk.get("max_correlated_positions", 1)),
+        )
+        if not corr_ok:
+            log_event(db, "scan_skipped", {"reason": corr_reason}, instrument=instrument)
             continue
 
         spread_too_high = snap.quote.spread_points > float(risk.get("max_spread_points", 5))
@@ -429,7 +457,11 @@ def run_scan(db: Session) -> list[TradeIdea]:
                 and state.auto_trading_enabled
                 and settings.execution_mode in ("demo", "live", "paper")
             ):
-                execute_idea(db, idea)
+                # Use limit orders at S/R levels when configured.
+                if risk.get("prefer_limit_orders", False) and proposal.entry_type == EntryType.LIMIT:
+                    _place_limit_order(db, idea, risk)
+                else:
+                    execute_idea(db, idea)
 
     db.commit()
 
@@ -441,6 +473,56 @@ def run_scan(db: Session) -> list[TradeIdea]:
         _spawn_shadow_batch(shadow_queue, ai_cfg.get("shadow_model"))
 
     return created
+
+
+# --------------------------------------------------------------------------
+# Limit order placement at S/R levels
+# --------------------------------------------------------------------------
+def _place_limit_order(db: Session, idea: TradeIdea, risk: dict) -> None:
+    """Place a working (limit) order at the proposed entry level instead of
+    a market order. If price never reaches the level the order expires unfilled,
+    which naturally filters out weak setups."""
+    from app.config import settings as cfg
+
+    if cfg.execution_mode == "paper":
+        # In paper mode just execute at the proposed price.
+        execute_idea(db, idea)
+        return
+
+    try:
+        from app.broker.capital import get_capital_client
+
+        client = get_capital_client()
+        broker_dir = "BUY" if idea.direction == "long" else "SELL"
+        res = client.create_working_order(
+            instrument=idea.instrument,
+            direction=broker_dir,
+            size=idea.position_size,
+            level=idea.entry_price,
+            order_type="LIMIT",
+            stop_level=idea.stop_loss,
+            profit_level=idea.take_profit_1,
+        )
+        deal_ref = res.get("dealReference", "")
+        idea.status = "pending_limit"
+        log_event(
+            db, "limit_order_placed",
+            {"idea_id": idea.id, "deal_ref": deal_ref, "level": idea.entry_price},
+            instrument=idea.instrument,
+        )
+        notify(
+            f"📋 Limit order: {idea.instrument} {idea.direction.upper()} "
+            f"@ {idea.entry_price} | SL {idea.stop_loss} TP {idea.take_profit_1}"
+        )
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            db, "limit_order_failed",
+            {"idea_id": idea.id, "error": str(exc)[:120]},
+            instrument=idea.instrument,
+        )
+        # Fall back to market execution.
+        execute_idea(db, idea)
 
 
 # --------------------------------------------------------------------------
@@ -538,9 +620,11 @@ def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
                   instrument=idea.instrument)
         db.commit()
         return None
-    # Use the freshly computed authoritative size.
-    idea.position_size = recheck.computed_size
-    idea.risk_aed = recheck.computed_risk_aed
+    # Dynamic position sizing: scale risk based on recent performance.
+    from app.risk.dynamic_sizing import compute_size_multiplier
+    size_mult = compute_size_multiplier(db, risk)
+    idea.position_size = round(recheck.computed_size * size_mult, 6)
+    idea.risk_aed = round(recheck.computed_risk_aed * size_mult, 2)
 
     executor = get_executor()
     direction = idea.direction
@@ -566,6 +650,9 @@ def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
     # that changes the real risk. If the slip pushed risk well past the
     # per-trade cap, abort the position rather than let it ride oversized.
     fill = result.fill_price or exec_entry
+    # Track execution quality (slippage).
+    from app.services.execution_quality import record_fill_quality
+    record_fill_quality(db, idea.id, idea.instrument, exec_entry, fill, direction)
     fx = ctx.account_ccy_per_point  # AED per 1-point move, size 1 (>0 here)
     risk_per_unit = abs(fill - idea.stop_loss)
     actual_risk_aed = idea.position_size * risk_per_unit * fx
