@@ -31,6 +31,7 @@ RISK = {
     **default_risk(),
     "require_location_filter": False,
     "require_confirmation": False,
+    "quality_size_scaling_enabled": False,
 }
 STRICT = default_risk()  # all setup-quality gates enabled
 STRAT = default_strategy()
@@ -261,46 +262,68 @@ def test_no_htf_data_does_not_block():
     assert d.approved
 
 
-# --- Setup-quality selection filter (4c–4f, 6b) ---
+# --- Setup-quality scoring (4c–4g) ---
 
 def test_long_requires_htf_bullish_bias():
-    # 1H/4H both sideways -> no bullish bias -> blocked even though not opposing.
+    # 1H/4H both sideways -> no bullish bias -> lower score than aligned.
     d = evaluate_proposal(_long(), _good_long_ctx(htf_trends={"1H": "sideways", "4H": "sideways"}), STRICT, STRAT)
-    assert not d.approved and "bias" in d.reason
+    d_aligned = evaluate_proposal(_long(), _good_long_ctx(), STRICT, STRAT)
+    assert d_aligned.quality_score > d.quality_score
 
 
 def test_long_blocked_when_not_at_support():
-    d = evaluate_proposal(_long(), _good_long_ctx(at_support=False), STRICT, STRAT)
-    assert not d.approved and "not at support" in d.reason
+    # Missing support + no HTF bias + no confirmation -> quality too low.
+    d = evaluate_proposal(
+        _long(),
+        _good_long_ctx(at_support=False, htf_trends={}, bullish_confirmation=False),
+        STRICT, STRAT,
+    )
+    assert not d.approved and "Quality score" in d.reason
 
 
 def test_long_blocked_when_into_resistance():
-    d = evaluate_proposal(_long(), _good_long_ctx(at_resistance=True), STRICT, STRAT)
-    assert not d.approved and "into resistance" in d.reason
+    # At resistance + no other factors -> low score, rejected.
+    d = evaluate_proposal(
+        _long(),
+        _good_long_ctx(at_resistance=True, at_support=False, htf_trends={}, bullish_confirmation=False),
+        STRICT, STRAT,
+    )
+    assert not d.approved and "Quality score" in d.reason
 
 
 def test_long_blocked_without_bullish_confirmation():
-    d = evaluate_proposal(_long(), _good_long_ctx(bullish_confirmation=False), STRICT, STRAT)
-    assert not d.approved and "confirmation" in d.reason
+    # Missing confirmation + no HTF + no location -> quality too low.
+    d = evaluate_proposal(
+        _long(),
+        _good_long_ctx(bullish_confirmation=False, htf_trends={}, at_support=False),
+        STRICT, STRAT,
+    )
+    assert not d.approved and "Quality score" in d.reason
 
 
 def test_long_approved_with_full_quality_setup():
     d = evaluate_proposal(_long(), _good_long_ctx(), STRICT, STRAT)
     assert d.approved, d.reason
+    assert d.quality_score >= 40
 
 
 def test_short_requires_resistance_and_bearish_confirmation():
     d = evaluate_proposal(_short(), _good_short_ctx(), STRICT, STRAT)
     assert d.approved, d.reason
-    d2 = evaluate_proposal(_short(), _good_short_ctx(at_resistance=False), STRICT, STRAT)
-    assert not d2.approved and "not at resistance" in d2.reason
-    d3 = evaluate_proposal(_short(), _good_short_ctx(bearish_confirmation=False), STRICT, STRAT)
-    assert not d3.approved and "confirmation" in d3.reason
+    # Missing resistance + confirmation + HTF -> quality too low.
+    d2 = evaluate_proposal(
+        _short(),
+        _good_short_ctx(at_resistance=False, bearish_confirmation=False, htf_trends={}),
+        STRICT, STRAT,
+    )
+    assert not d2.approved and "Quality score" in d2.reason
 
 
 def test_anti_scalp_blocks_tight_target():
     # reward = |102-100| = 2.0; ATR 3.0 -> need >= 3.0 -> blocked as scalp.
-    d = evaluate_proposal(_long(), _good_long_ctx(atr=3.0), STRICT, STRAT)
+    # Use a wider stop (SL=97) so the min-stop-vs-ATR gate passes (3 >= 0.5*3).
+    risk_cfg = {**STRICT, "min_stop_atr_multiple": 0.0}
+    d = evaluate_proposal(_long(), _good_long_ctx(atr=3.0), risk_cfg, STRAT)
     assert not d.approved and "scalp" in d.reason
 
 
@@ -312,17 +335,91 @@ def test_anti_scalp_allows_real_move():
 
 def test_volatility_band_blocks_chaotic_market():
     d = evaluate_proposal(_long(), _good_long_ctx(volatility_pct=12.0), STRICT, STRAT)
-    assert not d.approved and "Volatility" in d.reason
+    assert not d.approved and "volatility" in d.reason.lower()
 
 
 def test_volatility_band_blocks_dead_market():
     d = evaluate_proposal(_long(), _good_long_ctx(volatility_pct=0.001), STRICT, STRAT)
-    assert not d.approved and "Volatility" in d.reason
+    assert not d.approved and "volatility" in d.reason.lower()
 
 
 def test_setup_filters_toggle_off():
     risk = {**STRICT, "require_htf_bias": False, "require_location_filter": False,
-            "require_confirmation": False, "min_reward_atr": 0.0}
+            "require_confirmation": False, "min_reward_atr": 0.0,
+            "quality_size_scaling_enabled": False}
     # Bare ctx (no support/confirmation signals) is approved when filters are off.
     d = evaluate_proposal(_long(), _ctx(), risk, STRAT)
     assert d.approved, d.reason
+
+
+# --- Direction alignment gate (4ab) ---
+
+def test_short_rejected_in_bullish_market():
+    risk_cfg = {**RISK, "direction_alignment_enabled": True}
+    ctx = _ctx(market_classification="bullish_trend")
+    d = evaluate_proposal(_short(), ctx, risk_cfg, STRAT)
+    assert not d.approved and "Direction mismatch" in d.reason
+
+
+def test_long_rejected_in_bearish_market():
+    risk_cfg = {**RISK, "direction_alignment_enabled": True}
+    ctx = _ctx(market_classification="bearish_trend")
+    d = evaluate_proposal(_long(), ctx, risk_cfg, STRAT)
+    assert not d.approved and "Direction mismatch" in d.reason
+
+
+def test_short_allowed_in_bearish_market():
+    risk_cfg = {**RISK, "direction_alignment_enabled": True}
+    ctx = _ctx(market_classification="bearish_trend")
+    d = evaluate_proposal(_short(), ctx, risk_cfg, STRAT)
+    assert d.approved
+
+
+def test_long_allowed_in_range_bound():
+    risk_cfg = {**RISK, "direction_alignment_enabled": True}
+    ctx = _ctx(market_classification="range_bound")
+    d = evaluate_proposal(_long(), ctx, risk_cfg, STRAT)
+    assert d.approved
+
+
+def test_direction_alignment_disabled_allows_mismatch():
+    risk_cfg = {**RISK, "direction_alignment_enabled": False}
+    ctx = _ctx(market_classification="bullish_trend")
+    d = evaluate_proposal(_short(), ctx, risk_cfg, STRAT)
+    assert d.approved
+
+
+# --- Instrument cooldown (4a) ---
+
+def test_instrument_cooldown_blocks_after_recent_loss():
+    from datetime import datetime, timezone, timedelta
+    recent_loss = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    risk_cfg = {**RISK, "instrument_cooldown_minutes": 60}
+    ctx = _ctx(last_loss_instrument_ts=recent_loss)
+    d = evaluate_proposal(_long(), ctx, risk_cfg, STRAT)
+    assert not d.approved and "cooldown" in d.reason.lower()
+
+
+def test_instrument_cooldown_allows_after_enough_time():
+    from datetime import datetime, timezone, timedelta
+    old_loss = (datetime.now(timezone.utc) - timedelta(minutes=120)).isoformat()
+    risk_cfg = {**RISK, "instrument_cooldown_minutes": 60}
+    ctx = _ctx(last_loss_instrument_ts=old_loss)
+    d = evaluate_proposal(_long(), ctx, risk_cfg, STRAT)
+    assert d.approved
+
+
+# --- Consecutive loss pause (4aa) ---
+
+def test_consecutive_losses_pauses_trading():
+    risk_cfg = {**RISK, "max_consecutive_losses": 3}
+    ctx = _ctx(consecutive_losses=3)
+    d = evaluate_proposal(_long(), ctx, risk_cfg, STRAT)
+    assert not d.approved and "consecutive losses" in d.reason
+
+
+def test_under_consecutive_limit_allowed():
+    risk_cfg = {**RISK, "max_consecutive_losses": 3}
+    ctx = _ctx(consecutive_losses=2)
+    d = evaluate_proposal(_long(), ctx, risk_cfg, STRAT)
+    assert d.approved

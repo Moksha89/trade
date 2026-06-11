@@ -25,7 +25,17 @@ SYSTEM_PROMPT = (
     "instrument string in your response; the schema example is illustrative only. "
     "If there is no high-quality setup, return direction and strategy as 'no_trade'. "
     "Never invent prices; base entry/SL/TP on the supplied indicator data. "
-    "Respect a minimum risk/reward of 1:2. "
+    "CRITICAL DIRECTION RULE: You MUST trade in the direction of the market. "
+    "If market_classification is 'bullish_trend' or 'breakout', you MUST propose "
+    "'long' or 'no_trade' — NEVER 'short'. If market_classification is "
+    "'bearish_trend' or 'breakdown', you MUST propose 'short' or 'no_trade' — "
+    "NEVER 'long'. If 'range_bound', trade toward the opposite edge of the range. "
+    "If 'momentum', follow the trend direction shown in the indicators. "
+    "CRITICAL stop-loss rule: place the stop at least 1× ATR from entry "
+    "(use the 'atr' value in the indicators). Tight stops get blown by normal "
+    "volatility and slippage. For a long, stop_loss = entry - 1×ATR or wider; "
+    "for a short, stop_loss = entry + 1×ATR or wider. "
+    "Respect a minimum risk/reward of 1:1.5. "
     "When a 'performance_memory' field is present it is OUR ACTUAL realized "
     "track record for this instrument/direction/strategy (win rate, net AED, "
     "average R). Weight it heavily: favour instrument+direction+strategy "
@@ -51,9 +61,10 @@ SCHEMA_HINT = {
     "invalidation_condition": "when this setup becomes invalid",
     "risk_flags": [],
     "management_plan": {
-        "move_sl_to_breakeven_at_R": 0.7,
-        "lock_profit_at_R": 1.0,
-        "lock_profit_offset_R": 0.3,
+        "move_sl_to_breakeven_at_R": 1.2,
+        "lock_profit_at_R": 1.5,
+        "lock_profit_offset_R": 0.5,
+        "trail_atr_mult": 2.5,
         "partial_close_at_R": 2.0,
         "partial_close_percent": 50,
         "trail_start_R": 2.0,
@@ -156,7 +167,10 @@ def _heuristic_proposal(
             risk_flags=["heuristic_fallback"],
         )
 
-    confidence = 72.0 if condition != MarketCondition.MOMENTUM else 70.0
+    # Heuristic fallback proposals are NOT real AI analysis — set confidence
+    # below the risk engine threshold (70) so they are always rejected. This
+    # prevents random entries when the AI is unavailable.
+    confidence = 50.0
     return TradeProposal(
         instrument=instrument,
         direction=direction,
@@ -169,6 +183,7 @@ def _heuristic_proposal(
         confidence=confidence,
         risk_reward=round(rr(price, sl, tp1), 2),
         rationale=(
+            f"[HEURISTIC FALLBACK — AI unavailable] "
             f"{strategy.value} on {condition.value}: EMA trend={ind.trend}, "
             f"RSI={ind.rsi:.0f}, MACD hist={ind.macd_hist:.4f}."
         ),
@@ -212,20 +227,92 @@ def propose_trade(
     context: dict[str, Any] | None = None,
     model: str | None = None,
 ) -> tuple[TradeProposal, dict[str, Any], str]:
-    """Return (proposal, payload, prompt_hash). Falls back to heuristic on error."""
+    """Return (proposal, payload, prompt_hash).
+
+    Priority:
+      1. Specialist Desk (4 AI experts in pipeline) — best quality
+      2. OpenRouter consensus (3 models vote) — fallback
+      3. Claude — secondary fallback
+      4. Ollama — tertiary fallback
+      5. Heuristic — auto-reject
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
     context = context or {}
     payload = build_payload(instrument, ind, condition, context)
     phash = prompt_hash(payload)
     model = model or settings.anthropic_model
 
+    # Try Specialist Desk first (4 expert AIs in pipeline).
+    if settings.openrouter_api_key:
+        try:
+            from app.ai.specialist_desk import run_specialist_pipeline
+
+            proposal, meta = run_specialist_pipeline(
+                payload, instrument,
+                api_key=settings.openrouter_api_key,
+            )
+            stages = meta.get("stages", {})
+            logger.info(
+                "Specialist Desk for %s: analyst=%s pattern=%s signal=%s risk=%s (%dms)",
+                instrument,
+                stages.get("analyst", {}).get("result", {}).get("directional_bias"),
+                stages.get("pattern", {}).get("result", {}).get("pattern_bias"),
+                stages.get("signal", {}).get("result", {}).get("decision"),
+                stages.get("risk", {}).get("status"),
+                meta.get("total_latency_ms", 0),
+            )
+            return proposal, payload, phash
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Specialist Desk failed for %s: %s — trying consensus", instrument, exc)
+
+        # Fall back to consensus voting if specialist pipeline breaks.
+        try:
+            from app.ai.openrouter_engine import propose_trade_consensus
+
+            or_models = [
+                m.strip()
+                for m in settings.openrouter_models.split(",")
+                if m.strip()
+            ]
+            proposal, meta = propose_trade_consensus(
+                payload, instrument,
+                api_key=settings.openrouter_api_key,
+                models=or_models or None,
+            )
+            logger.info(
+                "OpenRouter consensus for %s: %s (votes=%s, models=%s)",
+                instrument,
+                meta.get("consensus_direction"),
+                meta.get("votes"),
+                meta.get("agreeing_models"),
+            )
+            return proposal, payload, phash
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("OpenRouter consensus failed for %s: %s", instrument, exc)
+
+    # Try Claude as secondary.
     if settings.anthropic_api_key:
         try:
             proposal = _call_claude(payload, model)
             return proposal, payload, phash
-        except Exception:  # noqa: BLE001 — any failure → safe deterministic fallback
-            proposal = _heuristic_proposal(instrument, ind, condition)
-            proposal.risk_flags = list({*proposal.risk_flags, "ai_error_fallback"})
-            return proposal, payload, phash
+        except Exception:  # noqa: BLE001
+            pass  # Fall through to Ollama
 
+    # Try Ollama as tertiary.
+    try:
+        from app.ai.ollama_engine import propose_trade_ollama
+
+        proposal, _latency = propose_trade_ollama(payload)
+        proposal.instrument = instrument
+        if "ollama_provider" not in proposal.risk_flags:
+            proposal.risk_flags = list({*proposal.risk_flags, "ollama_provider"})
+        return proposal, payload, phash
+    except Exception:  # noqa: BLE001
+        pass  # Fall through to heuristic
+
+    # Last resort: deterministic heuristic (confidence 50 → auto-reject).
     proposal = _heuristic_proposal(instrument, ind, condition)
+    proposal.risk_flags = list({*proposal.risk_flags, "ai_error_fallback"})
     return proposal, payload, phash

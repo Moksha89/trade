@@ -33,9 +33,10 @@ class EntryType(str, Enum):
 
 
 class ManagementPlan(BaseModel):
-    move_sl_to_breakeven_at_R: float = 0.7
-    lock_profit_at_R: float = 1.0
-    lock_profit_offset_R: float = 0.3
+    move_sl_to_breakeven_at_R: float = 1.2
+    lock_profit_at_R: float = 1.5
+    lock_profit_offset_R: float = 0.5
+    trail_atr_mult: float = 2.5
     partial_close_at_R: float = 2.0
     partial_close_percent: float = 50
     trail_start_R: float = 2.0  # begin ATR trailing once the first target (~TP1) is reached

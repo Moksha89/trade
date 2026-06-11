@@ -38,6 +38,14 @@ class RiskContext:
     # Each value is one of "up" | "down" | "sideways". Used to block trades that
     # fight the higher-timeframe trend. Empty disables the check.
     htf_trends: dict[str, str] = field(default_factory=dict)
+    # Market classification from the classifier — used to enforce direction
+    # alignment (e.g. reject shorts in a bullish_trend market).
+    market_classification: str = ""
+    # Timestamp of the last loss on this instrument (ISO string or empty).
+    # Used for per-instrument cooldown after losses.
+    last_loss_instrument_ts: str = ""
+    # Number of consecutive losses across ALL instruments.
+    consecutive_losses: int = 0
     # Setup-quality signals computed from the entry-timeframe indicators/candles.
     at_support: bool = False  # price sits near a support level
     at_resistance: bool = False  # price sits near a resistance level
@@ -54,6 +62,7 @@ class RiskDecision:
     computed_size: float = 0.0
     computed_risk_aed: float = 0.0
     risk_per_unit: float = 0.0
+    quality_score: float = 0.0
 
 
 _STRATEGY_TOGGLE = {
@@ -116,14 +125,79 @@ def evaluate_proposal(
             f"Confidence {proposal.confidence:.0f} below threshold {min_conf:.0f}"
         )
 
-    # 4b–4f. Setup-quality selection filter. Skipped on the execution re-check.
+    # 4a. Per-instrument cooldown after a loss.
+    if not skip_setup_quality and ctx.last_loss_instrument_ts:
+        from datetime import datetime, timezone
+        try:
+            last_loss_dt = datetime.fromisoformat(ctx.last_loss_instrument_ts)
+            cooldown_min = float(risk.get("instrument_cooldown_minutes", 60))
+            elapsed = (datetime.now(timezone.utc) - last_loss_dt).total_seconds() / 60
+            if elapsed < cooldown_min:
+                return reject(
+                    f"Instrument cooldown: last loss {elapsed:.0f}m ago "
+                    f"(need {cooldown_min:.0f}m)"
+                )
+        except (ValueError, TypeError):
+            pass  # malformed timestamp — skip cooldown
+
+    # 4aa. Consecutive loss pause: if N+ consecutive losses across all
+    # instruments, pause trading to stop the bleeding.
     if not skip_setup_quality:
-        # 4b. Higher-timeframe trend alignment. Reject trades that fight the
-        # higher timeframe trend — no longs while a higher timeframe is trending
-        # down, no shorts while it is trending up. A "sideways"/neutral timeframe
-        # never blocks; only a directly opposing trend does. This stops the
-        # counter-trend entries (e.g. buying into a 4H downtrend) that repeatedly
-        # got stopped out.
+        max_consec = int(risk.get("max_consecutive_losses", 3))
+        if ctx.consecutive_losses >= max_consec:
+            return reject(
+                f"{ctx.consecutive_losses} consecutive losses "
+                f"(pausing after {max_consec})"
+            )
+
+    # 4ab. Direction must align with market classification.
+    # The AI (especially small local models) often proposes shorts in uptrends.
+    # This deterministic gate catches that regardless of AI quality.
+    if not skip_setup_quality and risk.get("direction_alignment_enabled", True):
+        cls = ctx.market_classification
+        d = proposal.direction
+        _LONG_ONLY = {"bullish_trend", "breakout"}
+        _SHORT_ONLY = {"bearish_trend", "breakdown"}
+        if cls in _LONG_ONLY and d == Direction.SHORT:
+            return reject(
+                f"Direction mismatch: short in {cls} market"
+            )
+        if cls in _SHORT_ONLY and d == Direction.LONG:
+            return reject(
+                f"Direction mismatch: long in {cls} market"
+            )
+        # Momentum classification: only block when the trade opposes a
+        # UNANIMOUS HTF consensus with at least 2 opposing timeframes.
+        # Single HTF disagreement is acceptable — the specialist desk does
+        # its own multi-TF analysis.
+        if cls == "momentum":
+            if ctx.htf_trends:
+                up_count = sum(1 for v in ctx.htf_trends.values() if v == "up")
+                down_count = sum(1 for v in ctx.htf_trends.values() if v == "down")
+                if d == Direction.SHORT and up_count >= 2 and down_count == 0:
+                    return reject(
+                        "Direction mismatch: short in momentum-up market"
+                    )
+                if d == Direction.LONG and down_count >= 2 and up_count == 0:
+                    return reject(
+                        "Direction mismatch: long in momentum-down market"
+                    )
+
+    # 4b–4g. Quality scoring system. Each setup factor earns points toward a
+    # composite quality score (out of 100). Only setups that reach the minimum
+    # threshold are approved. This replaces the old binary pass/fail gates and
+    # lets trades with 4/5 factors aligned pass while blocking weak setups.
+    #
+    # Scoring weights:
+    #   HTF bias aligned       +25
+    #   At key S/R level       +25
+    #   Momentum confirmation  +20
+    #   Good volatility band   +15
+    #   AI confidence bonus    +15  (scaled: conf at threshold=0, conf 90=+15)
+    quality_score = 0.0
+    quality_notes: list[str] = []
+    if not skip_setup_quality:
+        # 4b. Counter-trend is still a HARD reject (biggest loss cause).
         if risk.get("trend_alignment_enabled", True) and ctx.htf_trends:
             opposing = "down" if proposal.direction == Direction.LONG else "up"
             against = [tf for tf, tr in ctx.htf_trends.items() if tr == opposing]
@@ -133,48 +207,70 @@ def evaluate_proposal(
                     f"{'/'.join(sorted(against))} {opposing}trend"
                 )
 
-        # 4c. Higher-timeframe directional bias. Stricter than 4b: the trade must
-        # be WITH a higher-timeframe trend, not merely non-opposing. A long needs
-        # at least one higher timeframe up; a short needs one down.
-        if risk.get("require_htf_bias", True) and ctx.htf_trends:
+        # 4c. HTF directional bias (scored). If no HTF data available or
+        # HTF check disabled, award full points (don't penalize for missing data).
+        if not risk.get("require_htf_bias", True) or not ctx.htf_trends:
+            quality_score += 25
+            quality_notes.append("htf_bias_skipped")
+        else:
             favouring = "up" if proposal.direction == Direction.LONG else "down"
-            if not any(tr == favouring for tr in ctx.htf_trends.values()):
-                return reject(f"No higher-timeframe {favouring}trend bias")
+            if any(tr == favouring for tr in ctx.htf_trends.values()):
+                quality_score += 25
+                quality_notes.append("htf_bias_aligned")
 
-        # 4d. Entry location. Buy at support with room above; sell at resistance
-        # with room below. Never buy into resistance or sell into support — the
-        # dominant BUY failure mode (buying straight into overhead supply).
-        if risk.get("require_location_filter", True):
-            if proposal.direction == Direction.LONG:
-                if ctx.at_resistance:
-                    return reject("Long into resistance")
-                if not ctx.at_support:
-                    return reject("Long not at support")
-            else:
-                if ctx.at_support:
-                    return reject("Short into support")
-                if not ctx.at_resistance:
-                    return reject("Short not at resistance")
+        # 4d. Entry location (scored). If location filter disabled, award full.
+        if not risk.get("require_location_filter", True):
+            quality_score += 25
+            quality_notes.append("location_skipped")
+        elif proposal.direction == Direction.LONG:
+            if ctx.at_resistance:
+                quality_notes.append("long_into_resistance")
+            elif ctx.at_support:
+                quality_score += 25
+                quality_notes.append("at_support")
+        else:
+            if ctx.at_support:
+                quality_notes.append("short_into_support")
+            elif ctx.at_resistance:
+                quality_score += 25
+                quality_notes.append("at_resistance")
 
-        # 4e. Confirmation candle + momentum. No buying into bearish momentum and
-        # no shorting into bullish momentum — require the latest candle and MACD
-        # to agree with the trade direction.
-        if risk.get("require_confirmation", True):
-            if proposal.direction == Direction.LONG and not ctx.bullish_confirmation:
-                return reject("No bullish confirmation candle")
-            if proposal.direction == Direction.SHORT and not ctx.bearish_confirmation:
-                return reject("No bearish confirmation candle")
+        # 4e. Confirmation candle + momentum (scored). If disabled, award full.
+        if not risk.get("require_confirmation", True):
+            quality_score += 20
+            quality_notes.append("confirmation_skipped")
+        elif proposal.direction == Direction.LONG and ctx.bullish_confirmation:
+            quality_score += 20
+            quality_notes.append("bullish_confirmed")
+        elif proposal.direction == Direction.SHORT and ctx.bearish_confirmation:
+            quality_score += 20
+            quality_notes.append("bearish_confirmed")
 
-        # 4f. Volatility band. Skip dead markets (nothing to capture) and chaotic
-        # ones (stops get blown through).
+        # 4f. Volatility band (scored, with hard reject for extremes).
         if ctx.volatility_pct > 0:
-            vmin = float(risk.get("min_volatility_pct", 0.03))
-            vmax = float(risk.get("max_volatility_pct", 8.0))
-            if not (vmin <= ctx.volatility_pct <= vmax):
+            vmin = float(risk.get("min_volatility_pct", 0.15))
+            vmax = float(risk.get("max_volatility_pct", 2.0))
+            if vmin <= ctx.volatility_pct <= vmax:
+                quality_score += 15
+                quality_notes.append("volatility_ok")
+            elif ctx.volatility_pct > vmax * 2 or ctx.volatility_pct < vmin * 0.3:
                 return reject(
-                    f"Volatility {ctx.volatility_pct:.2f}% outside band "
-                    f"{vmin:g}-{vmax:g}%"
+                    f"Extreme volatility {ctx.volatility_pct:.2f}% "
+                    f"(band {vmin:g}-{vmax:g}%)"
                 )
+
+        # 4g. AI confidence bonus (scaled 0–15 points).
+        min_conf = float(risk.get("min_confidence", 70))
+        conf_bonus = min(15.0, max(0.0, (proposal.confidence - min_conf) / 20.0 * 15.0))
+        quality_score += conf_bonus
+
+        # Minimum quality threshold.
+        min_quality = float(risk.get("min_quality_score", 40))
+        if quality_score < min_quality:
+            return reject(
+                f"Quality score {quality_score:.0f} below minimum {min_quality:.0f} "
+                f"(factors: {', '.join(quality_notes) or 'none'})"
+            )
 
     # 5. Valid SL/TP geometry (no trade without SL + TP).
     entry = proposal.entry_price
@@ -190,6 +286,17 @@ def evaluate_proposal(
     risk_per_unit = abs(entry - sl)
     if risk_per_unit <= 0:
         return reject("Zero stop distance")
+
+    # 5b. Minimum stop distance relative to ATR.
+    # Prevents the AI from proposing impossibly tight stops (e.g. 5 pips on
+    # EURUSD 15M) that any normal fill slippage will blow past the risk cap.
+    if not skip_setup_quality:
+        min_stop_atr = float(risk.get("min_stop_atr_multiple", 0.5))
+        if ctx.atr > 0 and risk_per_unit < min_stop_atr * ctx.atr:
+            return reject(
+                f"Stop distance {risk_per_unit:.4g} too tight "
+                f"(<{min_stop_atr:g}\u00d7 ATR {ctx.atr:.4g})"
+            )
 
     # 6. Minimum risk/reward.
     reward = abs(tp - entry)
@@ -283,18 +390,32 @@ def evaluate_proposal(
     # so the AED risk budget sizes the position correctly.
     if ctx.account_ccy_per_point <= 0:
         return reject("Cannot size: unverified currency conversion for instrument")
-    risk_per_unit_acct = risk_per_unit * ctx.account_ccy_per_point
+    # Add slippage buffer: size as if the stop is wider by 2× spread so that
+    # normal fill slippage doesn't push actual risk past the per-trade cap and
+    # trigger an abort (which wastes spread cost for no benefit).
+    slippage_buffer = 2.0 * max(ctx.spread_points, 0.0)
+    risk_per_unit_buffered = risk_per_unit + slippage_buffer
+    risk_per_unit_acct = risk_per_unit_buffered * ctx.account_ccy_per_point
     if risk_per_unit_acct <= 0:
         return reject("Zero stop distance")
     size = risk_budget / risk_per_unit_acct
     if size <= 0:
         return reject("Computed size is zero")
+
+    # Scale position size by quality score: marginal setups get smaller
+    # positions so a loss costs less while still participating.
+    if risk.get("quality_size_scaling_enabled", True) and quality_score > 0:
+        # 55 = min threshold → 70% size, 70 → 85%, 85+ → 100%
+        quality_scale = min(1.0, 0.55 + (quality_score / 100.0) * 0.45)
+        size *= quality_scale
+
     computed_risk = size * risk_per_unit_acct
 
     return RiskDecision(
         approved=True,
-        reason="Approved",
+        reason=f"Approved (quality {quality_score:.0f})",
         computed_size=round(size, 6),
         computed_risk_aed=round(computed_risk, 2),
         risk_per_unit=round(risk_per_unit, 6),
+        quality_score=round(quality_score, 1),
     )

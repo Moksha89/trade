@@ -25,6 +25,7 @@ from app.config import settings
 def _post_chat(base_url: str, model: str, payload: dict[str, Any], timeout: float) -> str:
     """Call Ollama's /api/chat with JSON-forced output and return the content."""
     user_content = (
+        "/nothink\n"  # disable qwen3 thinking mode for speed
         "Schema (return exactly this shape as JSON):\n"
         + json.dumps(SCHEMA_HINT, indent=2)
         + "\n\nPrepared market data:\n"
@@ -36,7 +37,7 @@ def _post_chat(base_url: str, model: str, payload: dict[str, Any], timeout: floa
             "model": model,
             "stream": False,
             "format": "json",  # force a single valid JSON object
-            "options": {"temperature": 0.2},
+            "options": {"temperature": 0.2, "num_ctx": 8192},
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},

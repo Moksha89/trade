@@ -2,8 +2,8 @@
 
 Runs the three scheduled cadences from the spec using APScheduler:
   every 30s  → health check + manage open trades
-  every 5m   → scan instruments, classify, AI propose, risk evaluate
-  every 15m  → journal snapshot + Telegram summary
+  every 15m  → scan instruments, classify, AI propose, risk evaluate
+  every 15m  → journal snapshot + Telegram summary (offset)
 
 The scan/auto-execute steps only run while the bot is marked running in
 BotState (toggled from the dashboard). Health + management always run so trades

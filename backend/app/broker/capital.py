@@ -94,10 +94,14 @@ class CapitalClient:
             raise CapitalError("session auth returned no tokens")
 
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        from app.broker.rate_limiter import get_rate_limiter
+
         self.ensure_session()
+        get_rate_limiter().acquire()
         resp = self._client.request(method, path, headers=self._auth_headers(), **kwargs)
         if resp.status_code == 401:  # session expired → re-auth once
             self.login()
+            get_rate_limiter().acquire()
             resp = self._client.request(
                 method, path, headers=self._auth_headers(), **kwargs
             )
@@ -329,6 +333,52 @@ class CapitalClient:
         if resp.status_code != 200:
             raise CapitalError(f"set hedging mode failed: {resp.status_code} {resp.text}")
         return self.get_hedging_mode()
+
+    # ---- working orders (limit / stop) ------------------------------------
+    def create_working_order(
+        self,
+        instrument: str,
+        direction: str,
+        size: float,
+        level: float,
+        order_type: str,
+        stop_level: float,
+        profit_level: float,
+        expiry: str = "GTC",
+    ) -> dict[str, Any]:
+        """Place a limit or stop working order.
+
+        order_type: "LIMIT" or "STOP"
+        expiry: "GTC" (good till cancelled) or ISO datetime
+        """
+        epic = self._epic(instrument)
+        payload = {
+            "epic": epic,
+            "direction": direction.upper(),
+            "size": size,
+            "level": level,
+            "type": order_type.upper(),
+            "stopLevel": stop_level,
+            "profitLevel": profit_level,
+            "guaranteedStop": False,
+            "timeInForce": expiry,
+        }
+        resp = self._request("POST", "/api/v1/workingorders", json=payload)
+        if resp.status_code not in (200, 201):
+            raise CapitalError(f"create working order failed: {resp.status_code} {resp.text}")
+        return resp.json()
+
+    def get_working_orders(self) -> list[dict[str, Any]]:
+        resp = self._request("GET", "/api/v1/workingorders")
+        if resp.status_code != 200:
+            raise CapitalError(f"working orders failed: {resp.status_code} {resp.text}")
+        return resp.json().get("workingOrders", [])
+
+    def cancel_working_order(self, deal_id: str) -> dict[str, Any]:
+        resp = self._request("DELETE", f"/api/v1/workingorders/{deal_id}")
+        if resp.status_code != 200:
+            raise CapitalError(f"cancel order failed: {resp.status_code} {resp.text}")
+        return resp.json()
 
     def close(self) -> None:
         self._client.close()

@@ -15,6 +15,8 @@ import threading
 import time
 from datetime import datetime, timezone
 
+import zoneinfo
+
 from sqlalchemy.orm import Session
 
 from app.ai.engine import propose_trade
@@ -71,21 +73,31 @@ def _entry_signals(ind, candles, zone_pct: float) -> dict[str, bool]:
     """Setup-quality signals from the entry-timeframe indicators and candles.
 
     - at_support / at_resistance: price sits within `zone_pct`% of a swing level.
-    - bullish/bearish_confirmation: latest candle direction agrees with MACD
-      momentum (no buying into bearish momentum / shorting into bullish).
+    - bullish/bearish_confirmation: requires 2 of the last 3 candles to agree
+      with the direction AND MACD histogram momentum. This filters out single-
+      candle noise that triggered false entries in the previous version.
     """
     price = float(ind.price)
     zone = zone_pct / 100.0
     at_support = price > 0 and abs(price - ind.support) / price <= zone
     at_resistance = price > 0 and abs(ind.resistance - price) / price <= zone
-    last = candles[-1]
-    green = last.close > last.open
-    red = last.close < last.open
+
+    # Multi-candle confirmation: require 2 of the last 3 candles to agree.
+    recent = candles[-3:] if len(candles) >= 3 else candles
+    green_count = sum(1 for c in recent if c.close > c.open)
+    red_count = sum(1 for c in recent if c.close < c.open)
+    # MACD histogram must show meaningful momentum (> 20% of ATR as threshold)
+    # to avoid triggering on flat/noisy histogram near zero.
+    macd_threshold = ind.atr * 0.0002 if ind.atr > 0 else 0.0
     return {
         "at_support": bool(at_support),
         "at_resistance": bool(at_resistance),
-        "bullish_confirmation": bool(green and ind.macd_hist > 0),
-        "bearish_confirmation": bool(red and ind.macd_hist < 0),
+        "bullish_confirmation": bool(
+            green_count >= 2 and ind.macd_hist > macd_threshold
+        ),
+        "bearish_confirmation": bool(
+            red_count >= 2 and ind.macd_hist < -macd_threshold
+        ),
     }
 
 
@@ -192,7 +204,74 @@ def _record_shadow(
 
 
 # --------------------------------------------------------------------------
-# Scan & propose (every 5 minutes)
+# Session filter — only trade during high-liquidity hours
+# --------------------------------------------------------------------------
+_LONDON_TZ = zoneinfo.ZoneInfo("Europe/London")
+
+
+def _in_trading_session(risk: dict) -> bool:
+    """Return True if the current time is within a high-liquidity trading session.
+
+    Default active windows (configurable via risk settings):
+      - London open:   07:00–11:00 UTC (covers London/EU open)
+      - NY overlap:    12:00–16:00 UTC (London + NY overlap, highest liquidity)
+      - NY afternoon:  16:00–20:00 UTC (NY session)
+
+    Outside these hours spreads widen, volume thins, and price action is choppy.
+    Weekends (Sat/Sun) are always skipped.
+    """
+    if not risk.get("session_filter_enabled", True):
+        return True
+    now = datetime.now(timezone.utc)
+    # Skip weekends entirely (Saturday=5, Sunday=6).
+    if now.weekday() >= 5:
+        return False
+    hour = now.hour
+    start = int(risk.get("session_start_hour_utc", 7))
+    end = int(risk.get("session_end_hour_utc", 20))
+    return start <= hour < end
+
+
+# --------------------------------------------------------------------------
+# Helpers for risk context enrichment
+# --------------------------------------------------------------------------
+def _last_loss_ts_for_instrument(db: Session, instrument: str) -> str:
+    """ISO timestamp of the most recent loss on this instrument, or empty."""
+    last = (
+        db.query(Trade)
+        .filter(
+            Trade.instrument == instrument,
+            Trade.status == "closed",
+            Trade.realized_pl < 0,
+        )
+        .order_by(Trade.closed_at.desc())
+        .first()
+    )
+    if last and last.closed_at:
+        return last.closed_at.isoformat()
+    return ""
+
+
+def _consecutive_losses(db: Session) -> int:
+    """Count of most recent consecutive losing trades (all instruments)."""
+    recent = (
+        db.query(Trade)
+        .filter(Trade.status == "closed")
+        .order_by(Trade.closed_at.desc())
+        .limit(10)
+        .all()
+    )
+    count = 0
+    for t in recent:
+        if (t.realized_pl or 0) < 0:
+            count += 1
+        else:
+            break
+    return count
+
+
+# --------------------------------------------------------------------------
+# Scan & propose (every 15 minutes)
 # --------------------------------------------------------------------------
 def run_scan(db: Session) -> list[TradeIdea]:
     risk = get_group(db, RISK)
@@ -206,6 +285,26 @@ def run_scan(db: Session) -> list[TradeIdea]:
     if state.trading_locked:
         log_event(db, "scan_skipped", {"reason": "trading locked"})
         return created
+
+    if not _in_trading_session(risk):
+        log_event(db, "scan_skipped", {"reason": "outside trading session"})
+        return created
+
+    # Drawdown circuit breaker: check account equity vs high-water mark.
+    from app.risk.drawdown import check_drawdown
+    account_capital = float(risk.get("account_capital", settings.account_start_capital))
+    if not check_drawdown(db, account_capital):
+        log_event(db, "scan_skipped", {"reason": "drawdown limit hit"})
+        return created
+
+    # News calendar: skip trading near high-impact events.
+    from app.services.news_calendar import is_near_high_impact_event
+    if risk.get("news_filter_enabled", True):
+        buffer_min = int(risk.get("news_buffer_minutes", 30))
+        near_news, news_desc = is_near_high_impact_event(buffer_min)
+        if near_news:
+            log_event(db, "scan_skipped", {"reason": f"near news: {news_desc}"})
+            return created
 
     open_now = accounts.open_trades(db)
     max_active = int(risk.get("max_active_trades", 2))
@@ -221,11 +320,24 @@ def run_scan(db: Session) -> list[TradeIdea]:
         if any(t.instrument == instrument for t in open_now):
             continue
         try:
-            candles = provider.get_candles(instrument, "5M", 250)
+            scan_tf = risk.get("scan_timeframe", "15M")
+            candles = provider.get_candles(instrument, scan_tf, 250)
             ind = compute_indicators(candles)
             snap = provider.get_snapshot(instrument)
         except Exception as exc:  # noqa: BLE001
             log_event(db, "market_data_error", {"error": str(exc)}, instrument=instrument)
+            continue
+
+        # Correlation guard: block if we already hold a correlated instrument.
+        from app.risk.correlation import check_correlation
+        open_dicts = [{"instrument": t.instrument, "direction": t.direction} for t in open_now]
+        corr_ok, corr_reason = check_correlation(
+            instrument, "", open_dicts,
+            enabled=risk.get("correlation_guard_enabled", True),
+            max_correlated=int(risk.get("max_correlated_positions", 1)),
+        )
+        if not corr_ok:
+            log_event(db, "scan_skipped", {"reason": corr_reason}, instrument=instrument)
             continue
 
         spread_too_high = snap.quote.spread_points > float(risk.get("max_spread_points", 5))
@@ -330,6 +442,9 @@ def run_scan(db: Session) -> list[TradeIdea]:
             bearish_confirmation=signals["bearish_confirmation"],
             volatility_pct=float(ind.volatility_pct),
             atr=float(ind.atr),
+            market_classification=condition.value,
+            last_loss_instrument_ts=_last_loss_ts_for_instrument(db, instrument),
+            consecutive_losses=_consecutive_losses(db),
         )
         decision = evaluate_proposal(proposal, ctx, risk, strategy)
 
@@ -383,7 +498,11 @@ def run_scan(db: Session) -> list[TradeIdea]:
                 and state.auto_trading_enabled
                 and settings.execution_mode in ("demo", "live", "paper")
             ):
-                execute_idea(db, idea)
+                # Use limit orders at S/R levels when configured.
+                if risk.get("prefer_limit_orders", False) and proposal.entry_type == EntryType.LIMIT:
+                    _place_limit_order(db, idea, risk)
+                else:
+                    execute_idea(db, idea)
 
     db.commit()
 
@@ -395,6 +514,56 @@ def run_scan(db: Session) -> list[TradeIdea]:
         _spawn_shadow_batch(shadow_queue, ai_cfg.get("shadow_model"))
 
     return created
+
+
+# --------------------------------------------------------------------------
+# Limit order placement at S/R levels
+# --------------------------------------------------------------------------
+def _place_limit_order(db: Session, idea: TradeIdea, risk: dict) -> None:
+    """Place a working (limit) order at the proposed entry level instead of
+    a market order. If price never reaches the level the order expires unfilled,
+    which naturally filters out weak setups."""
+    from app.config import settings as cfg
+
+    if cfg.execution_mode == "paper":
+        # In paper mode just execute at the proposed price.
+        execute_idea(db, idea)
+        return
+
+    try:
+        from app.broker.capital import get_capital_client
+
+        client = get_capital_client()
+        broker_dir = "BUY" if idea.direction == "long" else "SELL"
+        res = client.create_working_order(
+            instrument=idea.instrument,
+            direction=broker_dir,
+            size=idea.position_size,
+            level=idea.entry_price,
+            order_type="LIMIT",
+            stop_level=idea.stop_loss,
+            profit_level=idea.take_profit_1,
+        )
+        deal_ref = res.get("dealReference", "")
+        idea.status = "pending_limit"
+        log_event(
+            db, "limit_order_placed",
+            {"idea_id": idea.id, "deal_ref": deal_ref, "level": idea.entry_price},
+            instrument=idea.instrument,
+        )
+        notify(
+            f"📋 Limit order: {idea.instrument} {idea.direction.upper()} "
+            f"@ {idea.entry_price} | SL {idea.stop_loss} TP {idea.take_profit_1}"
+        )
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            db, "limit_order_failed",
+            {"idea_id": idea.id, "error": str(exc)[:120]},
+            instrument=idea.instrument,
+        )
+        # Fall back to market execution.
+        execute_idea(db, idea)
 
 
 # --------------------------------------------------------------------------
@@ -418,7 +587,7 @@ def _proposal_from_idea(idea: TradeIdea, entry_price: float | None = None) -> Tr
 
 def _execution_entry_and_spread(
     provider: MarketDataProvider, idea: TradeIdea
-) -> tuple[float, float]:
+) -> tuple[float | None, float]:
     """Live execution price and spread for sizing/gating at execution time.
 
     The AI's proposed entry is stale by the time we execute; on wide-spread
@@ -428,12 +597,15 @@ def _execution_entry_and_spread(
     so realized risk reflects the actual fill. Limit/stop entries fill at their
     own level, so we keep the proposed price. The spread (ask-bid) is returned
     so the risk engine can reject setups whose stop is too tight versus it.
-    Falls back to the proposed entry (and zero spread) if no live quote.
+    Returns ``(None, 0.0)`` when no live quote is available so the caller can
+    abort rather than sizing against a stale price.
     """
     try:
         q = provider.get_quote(idea.instrument)
     except Exception:  # noqa: BLE001
-        return idea.entry_price, 0.0
+        # No live quote → return None to signal the caller that we cannot
+        # safely size a market order against a stale price.
+        return None, 0.0
     spread = q.spread_points or abs((q.ask or 0.0) - (q.bid or 0.0))
     if idea.entry_type != EntryType.MARKET.value:
         return idea.entry_price, spread
@@ -474,6 +646,14 @@ def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
     # past the per-trade risk cap (the proposed entry is stale by now). The
     # live spread feeds the stop-vs-spread quality gate in the risk engine.
     exec_entry, exec_spread = _execution_entry_and_spread(provider, idea)
+    if exec_entry is None:
+        idea.status = "rejected"
+        idea.risk_reason = "no live quote at execution time — refusing to size against stale price"
+        log_event(db, "execute_blocked",
+                  {"idea_id": idea.id, "reason": idea.risk_reason},
+                  instrument=idea.instrument)
+        db.commit()
+        return None
     ctx.spread_points = exec_spread
     # Setup-quality gates (trend/location/confirmation/scalp) were validated at
     # scan time; the execution re-check only re-verifies dynamic risk so a tiny
@@ -492,9 +672,18 @@ def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
                   instrument=idea.instrument)
         db.commit()
         return None
-    # Use the freshly computed authoritative size.
-    idea.position_size = recheck.computed_size
-    idea.risk_aed = recheck.computed_risk_aed
+    # Dynamic position sizing: scale risk based on recent performance.
+    from app.risk.dynamic_sizing import compute_size_multiplier
+    size_mult = compute_size_multiplier(db, risk)
+    # Cap the multiplier so dynamic sizing can never push actual risk past the
+    # slippage-abort tolerance — otherwise we open AND close instantly, paying
+    # spread cost for nothing.
+    cap = float(risk.get("max_risk_per_trade", 50))
+    if recheck.computed_risk_aed > 0:
+        max_mult = (cap * SLIPPAGE_ABORT_TOLERANCE) / recheck.computed_risk_aed
+        size_mult = min(size_mult, max_mult)
+    idea.position_size = round(recheck.computed_size * size_mult, 6)
+    idea.risk_aed = round(recheck.computed_risk_aed * size_mult, 2)
 
     executor = get_executor()
     direction = idea.direction
@@ -520,6 +709,9 @@ def execute_idea(db: Session, idea: TradeIdea) -> Trade | None:
     # that changes the real risk. If the slip pushed risk well past the
     # per-trade cap, abort the position rather than let it ride oversized.
     fill = result.fill_price or exec_entry
+    # Track execution quality (slippage).
+    from app.services.execution_quality import record_fill_quality
+    record_fill_quality(db, idea.id, idea.instrument, exec_entry, fill, direction)
     fx = ctx.account_ccy_per_point  # AED per 1-point move, size 1 (>0 here)
     risk_per_unit = abs(fill - idea.stop_loss)
     actual_risk_aed = idea.position_size * risk_per_unit * fx
@@ -850,7 +1042,7 @@ def _protect_and_grade_manual(
     control of exiting. All broker/market errors are caught so a manual trade can
     never break the manage loop."""
     try:
-        candles = provider.get_candles(trade.instrument, "5M", 200)
+        candles = provider.get_candles(trade.instrument, "15M", 200)
         ind = compute_indicators(candles)
     except Exception as exc:  # noqa: BLE001
         log_event(
@@ -1068,15 +1260,58 @@ def manage_open_trades(db: Session) -> None:
             trade.partial_closed or tp1_hit or cur_r >= float(plan.get("trail_start_R", 2.0))
         )
         trail_level = None
+        trail_atr_mult = float(plan.get("trail_atr_mult", 2.5))
         if trail_started:
             try:
-                ind = compute_indicators(provider.get_candles(trade.instrument, "5M", 60))
+                ind = compute_indicators(provider.get_candles(trade.instrument, "15M", 60))
                 if trade.direction == "long":
-                    trail_level = ind.price - ind.atr
+                    trail_level = ind.price - trail_atr_mult * ind.atr
                 else:
-                    trail_level = ind.price + ind.atr
+                    trail_level = ind.price + trail_atr_mult * ind.atr
             except Exception:  # noqa: BLE001
                 trail_level = None
+
+        # Ask the AI Trade Manager for dynamic adjustments (non-blocking:
+        # if it fails the deterministic rules below still apply).
+        ai_trail_override = None
+        if trail_started and settings.openrouter_api_key:
+            try:
+                from app.ai.specialist_desk import ai_manage_trade
+                ai_result = ai_manage_trade(
+                    {
+                        "instrument": trade.instrument,
+                        "direction": trade.direction,
+                        "entry_price": trade.entry_price,
+                        "current_price": price,
+                        "stop_loss": trade.stop_loss,
+                        "take_profit_1": trade.take_profit_1,
+                        "current_r": round(cur_r, 2),
+                        "atr": float(ind.atr) if ind else 0,
+                        "risk_per_unit": rpu,
+                    },
+                    ind.as_dict() if ind else {},
+                )
+                if ai_result.get("action") == "close":
+                    close_trade(db, trade, price, f"ai_manager: {ai_result.get('reason', 'close')}")
+                    db.commit()
+                    continue
+                if ai_result.get("trail_atr_mult") and trail_level is not None and ind:
+                    ai_mult = float(ai_result["trail_atr_mult"])
+                    if 1.0 <= ai_mult <= 4.0:
+                        if trade.direction == "long":
+                            ai_trail_override = ind.price - ai_mult * ind.atr
+                        else:
+                            ai_trail_override = ind.price + ai_mult * ind.atr
+            except Exception:  # noqa: BLE001
+                pass  # Deterministic rules still run below
+
+        # Use AI trail if tighter than deterministic trail.
+        effective_trail = trail_level
+        if ai_trail_override is not None and trail_level is not None:
+            if trade.direction == "long":
+                effective_trail = max(trail_level, ai_trail_override)
+            else:
+                effective_trail = min(trail_level, ai_trail_override)
 
         actions = compute_management_actions(
             direction=trade.direction,
@@ -1088,7 +1323,7 @@ def manage_open_trades(db: Session) -> None:
             breakeven_done=trade.breakeven_moved,
             profit_locked=trade.profit_locked,
             partial_done=trade.partial_closed,
-            trail_level=trail_level,
+            trail_level=effective_trail,
         )
 
         if actions.close:
