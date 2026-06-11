@@ -38,6 +38,14 @@ class RiskContext:
     # Each value is one of "up" | "down" | "sideways". Used to block trades that
     # fight the higher-timeframe trend. Empty disables the check.
     htf_trends: dict[str, str] = field(default_factory=dict)
+    # Market classification from the classifier — used to enforce direction
+    # alignment (e.g. reject shorts in a bullish_trend market).
+    market_classification: str = ""
+    # Timestamp of the last loss on this instrument (ISO string or empty).
+    # Used for per-instrument cooldown after losses.
+    last_loss_instrument_ts: str = ""
+    # Number of consecutive losses across ALL instruments.
+    consecutive_losses: int = 0
     # Setup-quality signals computed from the entry-timeframe indicators/candles.
     at_support: bool = False  # price sits near a support level
     at_resistance: bool = False  # price sits near a resistance level
@@ -116,6 +124,61 @@ def evaluate_proposal(
         return reject(
             f"Confidence {proposal.confidence:.0f} below threshold {min_conf:.0f}"
         )
+
+    # 4a. Per-instrument cooldown after a loss.
+    if not skip_setup_quality and ctx.last_loss_instrument_ts:
+        from datetime import datetime, timezone
+        try:
+            last_loss_dt = datetime.fromisoformat(ctx.last_loss_instrument_ts)
+            cooldown_min = float(risk.get("instrument_cooldown_minutes", 60))
+            elapsed = (datetime.now(timezone.utc) - last_loss_dt).total_seconds() / 60
+            if elapsed < cooldown_min:
+                return reject(
+                    f"Instrument cooldown: last loss {elapsed:.0f}m ago "
+                    f"(need {cooldown_min:.0f}m)"
+                )
+        except (ValueError, TypeError):
+            pass  # malformed timestamp — skip cooldown
+
+    # 4aa. Consecutive loss pause: if N+ consecutive losses across all
+    # instruments, pause trading to stop the bleeding.
+    if not skip_setup_quality:
+        max_consec = int(risk.get("max_consecutive_losses", 3))
+        if ctx.consecutive_losses >= max_consec:
+            return reject(
+                f"{ctx.consecutive_losses} consecutive losses "
+                f"(pausing after {max_consec})"
+            )
+
+    # 4ab. Direction must align with market classification.
+    # The AI (especially small local models) often proposes shorts in uptrends.
+    # This deterministic gate catches that regardless of AI quality.
+    if not skip_setup_quality and risk.get("direction_alignment_enabled", True):
+        cls = ctx.market_classification
+        d = proposal.direction
+        _LONG_ONLY = {"bullish_trend", "breakout"}
+        _SHORT_ONLY = {"bearish_trend", "breakdown"}
+        if cls in _LONG_ONLY and d == Direction.SHORT:
+            return reject(
+                f"Direction mismatch: short in {cls} market"
+            )
+        if cls in _SHORT_ONLY and d == Direction.LONG:
+            return reject(
+                f"Direction mismatch: long in {cls} market"
+            )
+        # Momentum classification: direction must follow the trend.
+        if cls == "momentum":
+            if ctx.htf_trends:
+                up_count = sum(1 for v in ctx.htf_trends.values() if v == "up")
+                down_count = sum(1 for v in ctx.htf_trends.values() if v == "down")
+                if d == Direction.SHORT and up_count > down_count:
+                    return reject(
+                        "Direction mismatch: short in momentum-up market"
+                    )
+                if d == Direction.LONG and down_count > up_count:
+                    return reject(
+                        "Direction mismatch: long in momentum-down market"
+                    )
 
     # 4b–4g. Quality scoring system. Each setup factor earns points toward a
     # composite quality score (out of 100). Only setups that reach the minimum
@@ -335,6 +398,14 @@ def evaluate_proposal(
     size = risk_budget / risk_per_unit_acct
     if size <= 0:
         return reject("Computed size is zero")
+
+    # Scale position size by quality score: marginal setups get smaller
+    # positions so a loss costs less while still participating.
+    if risk.get("quality_size_scaling_enabled", True) and quality_score > 0:
+        # 55 = min threshold → 70% size, 70 → 85%, 85+ → 100%
+        quality_scale = min(1.0, 0.55 + (quality_score / 100.0) * 0.45)
+        size *= quality_scale
+
     computed_risk = size * risk_per_unit_acct
 
     return RiskDecision(

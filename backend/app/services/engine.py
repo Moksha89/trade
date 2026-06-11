@@ -233,6 +233,44 @@ def _in_trading_session(risk: dict) -> bool:
 
 
 # --------------------------------------------------------------------------
+# Helpers for risk context enrichment
+# --------------------------------------------------------------------------
+def _last_loss_ts_for_instrument(db: Session, instrument: str) -> str:
+    """ISO timestamp of the most recent loss on this instrument, or empty."""
+    last = (
+        db.query(Trade)
+        .filter(
+            Trade.instrument == instrument,
+            Trade.status == "closed",
+            Trade.realized_pl < 0,
+        )
+        .order_by(Trade.closed_at.desc())
+        .first()
+    )
+    if last and last.closed_at:
+        return last.closed_at.isoformat()
+    return ""
+
+
+def _consecutive_losses(db: Session) -> int:
+    """Count of most recent consecutive losing trades (all instruments)."""
+    recent = (
+        db.query(Trade)
+        .filter(Trade.status == "closed")
+        .order_by(Trade.closed_at.desc())
+        .limit(10)
+        .all()
+    )
+    count = 0
+    for t in recent:
+        if (t.realized_pl or 0) < 0:
+            count += 1
+        else:
+            break
+    return count
+
+
+# --------------------------------------------------------------------------
 # Scan & propose (every 15 minutes)
 # --------------------------------------------------------------------------
 def run_scan(db: Session) -> list[TradeIdea]:
@@ -404,6 +442,9 @@ def run_scan(db: Session) -> list[TradeIdea]:
             bearish_confirmation=signals["bearish_confirmation"],
             volatility_pct=float(ind.volatility_pct),
             atr=float(ind.atr),
+            market_classification=condition.value,
+            last_loss_instrument_ts=_last_loss_ts_for_instrument(db, instrument),
+            consecutive_losses=_consecutive_losses(db),
         )
         decision = evaluate_proposal(proposal, ctx, risk, strategy)
 

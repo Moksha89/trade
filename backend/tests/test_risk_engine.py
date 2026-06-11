@@ -31,6 +31,7 @@ RISK = {
     **default_risk(),
     "require_location_filter": False,
     "require_confirmation": False,
+    "quality_size_scaling_enabled": False,
 }
 STRICT = default_risk()  # all setup-quality gates enabled
 STRAT = default_strategy()
@@ -344,7 +345,81 @@ def test_volatility_band_blocks_dead_market():
 
 def test_setup_filters_toggle_off():
     risk = {**STRICT, "require_htf_bias": False, "require_location_filter": False,
-            "require_confirmation": False, "min_reward_atr": 0.0}
+            "require_confirmation": False, "min_reward_atr": 0.0,
+            "quality_size_scaling_enabled": False}
     # Bare ctx (no support/confirmation signals) is approved when filters are off.
     d = evaluate_proposal(_long(), _ctx(), risk, STRAT)
     assert d.approved, d.reason
+
+
+# --- Direction alignment gate (4ab) ---
+
+def test_short_rejected_in_bullish_market():
+    risk_cfg = {**RISK, "direction_alignment_enabled": True}
+    ctx = _ctx(market_classification="bullish_trend")
+    d = evaluate_proposal(_short(), ctx, risk_cfg, STRAT)
+    assert not d.approved and "Direction mismatch" in d.reason
+
+
+def test_long_rejected_in_bearish_market():
+    risk_cfg = {**RISK, "direction_alignment_enabled": True}
+    ctx = _ctx(market_classification="bearish_trend")
+    d = evaluate_proposal(_long(), ctx, risk_cfg, STRAT)
+    assert not d.approved and "Direction mismatch" in d.reason
+
+
+def test_short_allowed_in_bearish_market():
+    risk_cfg = {**RISK, "direction_alignment_enabled": True}
+    ctx = _ctx(market_classification="bearish_trend")
+    d = evaluate_proposal(_short(), ctx, risk_cfg, STRAT)
+    assert d.approved
+
+
+def test_long_allowed_in_range_bound():
+    risk_cfg = {**RISK, "direction_alignment_enabled": True}
+    ctx = _ctx(market_classification="range_bound")
+    d = evaluate_proposal(_long(), ctx, risk_cfg, STRAT)
+    assert d.approved
+
+
+def test_direction_alignment_disabled_allows_mismatch():
+    risk_cfg = {**RISK, "direction_alignment_enabled": False}
+    ctx = _ctx(market_classification="bullish_trend")
+    d = evaluate_proposal(_short(), ctx, risk_cfg, STRAT)
+    assert d.approved
+
+
+# --- Instrument cooldown (4a) ---
+
+def test_instrument_cooldown_blocks_after_recent_loss():
+    from datetime import datetime, timezone, timedelta
+    recent_loss = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    risk_cfg = {**RISK, "instrument_cooldown_minutes": 60}
+    ctx = _ctx(last_loss_instrument_ts=recent_loss)
+    d = evaluate_proposal(_long(), ctx, risk_cfg, STRAT)
+    assert not d.approved and "cooldown" in d.reason.lower()
+
+
+def test_instrument_cooldown_allows_after_enough_time():
+    from datetime import datetime, timezone, timedelta
+    old_loss = (datetime.now(timezone.utc) - timedelta(minutes=120)).isoformat()
+    risk_cfg = {**RISK, "instrument_cooldown_minutes": 60}
+    ctx = _ctx(last_loss_instrument_ts=old_loss)
+    d = evaluate_proposal(_long(), ctx, risk_cfg, STRAT)
+    assert d.approved
+
+
+# --- Consecutive loss pause (4aa) ---
+
+def test_consecutive_losses_pauses_trading():
+    risk_cfg = {**RISK, "max_consecutive_losses": 3}
+    ctx = _ctx(consecutive_losses=3)
+    d = evaluate_proposal(_long(), ctx, risk_cfg, STRAT)
+    assert not d.approved and "consecutive losses" in d.reason
+
+
+def test_under_consecutive_limit_allowed():
+    risk_cfg = {**RISK, "max_consecutive_losses": 3}
+    ctx = _ctx(consecutive_losses=2)
+    d = evaluate_proposal(_long(), ctx, risk_cfg, STRAT)
+    assert d.approved
