@@ -229,16 +229,44 @@ def propose_trade(
 ) -> tuple[TradeProposal, dict[str, Any], str]:
     """Return (proposal, payload, prompt_hash).
 
-    Priority: Claude → Ollama → heuristic fallback.
-    If Claude credits are exhausted or unavailable, Ollama is used as the
-    primary AI provider. Heuristic is the last resort (auto-rejects).
+    Priority: OpenRouter consensus → Claude → Ollama → heuristic fallback.
+    OpenRouter calls 3 models in parallel and requires 2/3 agreement.
     """
+    import logging
+
+    logger = logging.getLogger(__name__)
     context = context or {}
     payload = build_payload(instrument, ind, condition, context)
     phash = prompt_hash(payload)
     model = model or settings.anthropic_model
 
-    # Try Claude first.
+    # Try OpenRouter multi-model consensus first.
+    if settings.openrouter_api_key:
+        try:
+            from app.ai.openrouter_engine import propose_trade_consensus
+
+            or_models = [
+                m.strip()
+                for m in settings.openrouter_models.split(",")
+                if m.strip()
+            ]
+            proposal, meta = propose_trade_consensus(
+                payload, instrument,
+                api_key=settings.openrouter_api_key,
+                models=or_models or None,
+            )
+            logger.info(
+                "OpenRouter consensus for %s: %s (votes=%s, models=%s)",
+                instrument,
+                meta.get("consensus_direction"),
+                meta.get("votes"),
+                meta.get("agreeing_models"),
+            )
+            return proposal, payload, phash
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("OpenRouter consensus failed for %s: %s", instrument, exc)
+
+    # Try Claude as secondary.
     if settings.anthropic_api_key:
         try:
             proposal = _call_claude(payload, model)
@@ -246,7 +274,7 @@ def propose_trade(
         except Exception:  # noqa: BLE001
             pass  # Fall through to Ollama
 
-    # Try Ollama as secondary (or primary if no Claude key).
+    # Try Ollama as tertiary.
     try:
         from app.ai.ollama_engine import propose_trade_ollama
 

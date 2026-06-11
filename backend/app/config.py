@@ -56,6 +56,8 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-5-20250929"
     openai_api_key: str = ""
+    openrouter_api_key: str = ""
+    openrouter_models: str = "google/gemini-2.0-flash-001,meta-llama/llama-3.1-70b-instruct,mistralai/mistral-small-2501"
     ai_min_confidence: int = 70
 
     # Local model (Ollama) — used for shadow comparison against Claude. The
